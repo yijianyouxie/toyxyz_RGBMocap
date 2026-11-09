@@ -183,8 +183,16 @@ def binding(project,manifest,body):
     prepare_cameras(root)
     record=resolve(root,body)
     import numpy as np
+    # The group root is the shared world frame itself, not an actor row.
+    # Correcting the group project must not depend on a person-take entry.
+    if Path(project).resolve()==Path(root).resolve():
+        return dict(signature=record['signature'],floor=float(record['floor']),coordinate_frame='shared_world',
+            local_to_shared=np.eye(4).tolist(),local_plane_normal=[0.,1.,0.],
+            local_plane_height=float(record['floor']))
     relative=Path(project).resolve().relative_to(root).as_posix()
-    row=next(row for row in record['inputs']['actors'] if row['project']==relative)
+    row=next((row for row in record['inputs']['actors'] if row['project']==relative),None)
+    if row is None:
+        raise ValueError('Project is not registered as an actor in the shared people scene. Re-run Prepare Person Motion or clear the people group.')
     transform=np.linalg.inv(np.asarray(record['inputs']['reference']))@np.asarray(row['world_to_camera'])
     return dict(signature=record['signature'],floor=record['floor'],coordinate_frame='shared_world',
         local_to_shared=transform.tolist(),local_plane_normal=transform[1,:3].tolist(),

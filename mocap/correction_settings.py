@@ -37,7 +37,7 @@ def correction_options(options=None):
     pelvis = float(options.get('pelvis_offset', 0.))
     if not math.isfinite(pelvis) or abs(pelvis) > .25:
         raise ValueError('Pelvis height offset must be between -0.25 and +0.25 meters')
-    return {'auto_floor': auto, 'floor': floor, 'preset': preset, 'pelvis_offset': pelvis, 'mode':mode, 'foot_lock':bool(options.get('foot_lock',True)), 'hand_lock':bool(options.get('hand_lock',False))}
+    return {'auto_floor': auto, 'floor': floor, 'preset': preset, 'pelvis_offset': pelvis, 'mode':mode, 'foot_lock':bool(options.get('foot_lock',True)), 'hand_lock':bool(options.get('hand_lock',False)), 'balance':bool(options.get('balance',True))}
 
 
 def effective_options(project,state):

@@ -641,7 +641,7 @@ class PeopleWorkspace:
         for person in selected:
             args=['--project',str(self.people_root),'--person-id',str(person['id']),
                 '--first-frame',str(begin),'--end-frame',str(finish),'--result',self._people_result,
-                '--correction-preset',options['preset'],'--correction-mode',options['mode'],'--foot-lock',str(int(options['foot_lock'])),'--hand-lock',str(int(options['hand_lock'])),'--pelvis-offset',str(options['pelvis_offset'])]
+                '--correction-preset',options['preset'],'--correction-mode',options['mode'],'--foot-lock',str(int(options['foot_lock'])),'--hand-lock',str(int(options['hand_lock'])),'--balance',str(int(options['balance'])),'--pelvis-offset',str(options['pelvis_offset'])]
             if not options['auto_floor']:args+=['--floor',str(options['floor'])]
             jobs.append(('person',args))
         self.start_jobs(jobs)

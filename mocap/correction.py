@@ -13,7 +13,7 @@ import os
 import shutil
 import numpy as np
 from scipy.spatial.transform import Rotation
-from scipy.ndimage import gaussian_filter1d, maximum_filter1d, minimum_filter1d
+from scipy.ndimage import gaussian_filter1d, maximum_filter1d, minimum_filter1d, binary_dilation
 from scipy.linalg import solve_banded
 from .correction_settings import PRESETS
 
@@ -47,6 +47,155 @@ def fk(rest, root, quat):
 def intervals(active):
     edges=np.diff(np.r_[False,active,False].astype(np.int8))
     return list(zip(np.flatnonzero(edges==1),np.flatnonzero(edges==-1)))
+
+
+def body_com(positions):
+    """Whole-body centre of mass from the 22 SMPL-X joints.
+
+    Dempster segment fractions, with each segment's mass at its endpoint
+    midpoint. The absolute scale cancels because the result is normalized.
+    This is a planning metric, not a physics simulation.
+    """
+    com=np.zeros((len(positions),3),np.float64);total=0.
+    def add(point,weight):
+        nonlocal com,total
+        com+=weight*point;total+=weight
+    def mid(a,b):
+        return (positions[:,a]+positions[:,b])*.5
+    add(positions[:,0],.142)
+    add(mid(0,3),.139)
+    add(mid(3,6),.216)
+    add(positions[:,9],.04)
+    add(positions[:,15],.081)
+    for collar,shoulder,elbow,wrist in ((13,16,18,20),(14,17,19,21)):
+        add(mid(9,collar),.008)
+        add(mid(shoulder,elbow),.028)
+        add(mid(elbow,wrist),.016)
+        add(positions[:,wrist],.006)
+    for hip,knee,ankle,toe in ((1,4,7,10),(2,5,8,11)):
+        add(mid(hip,knee),.100)
+        add(mid(knee,ankle),.0465)
+        add(mid(ankle,toe),.0145)
+    return com/np.maximum(total,1e-9)
+
+
+def balance_pose(rest,root,quat,probes,active,floor,fps,max_pitch=12.,deadband=.02,iterations=3):
+    """Rotate the sagittal pose forward until the COM sits over the support.
+
+    The source of the bias is monocular depth ambiguity: a front camera
+    cannot distinguish a vertical leg from a slightly foreshortened one.
+    A 1-2 percent leg-length mismatch therefore becomes an 8 degree lean.
+    This pass only corrects a backward (COM behind support) lean. It keeps
+    planted ankles at their corrected world positions and keeps active ankle
+    orientations unchanged, so the soles stay flat and do not skate.
+    """
+    from .anatomical_ik import solve_legs
+    n=len(root)
+    empty=dict(balance=False,balance_frames=0,balance_pitch_mean_deg=0.,balance_pitch_max_deg=0.,
+               balance_margin_before_mean_m=0.,balance_margin_after_mean_m=0.,
+               balance_inside_before_pct=0.,balance_inside_after_pct=0.,max_balance_ankle_slip_m=0.)
+    if n<2 or not active.any():return root,quat,empty
+    pos,world=fk(rest,root,quat)
+    targets=pos[:,[7,8]].copy()
+    ankle0=world[:,[7,8]].copy()
+    up=np.array([0.,1.,0.])
+    def axes(P):
+        left=P[:,1]-P[:,2];left[:,1]=0.
+        length=np.linalg.norm(left,axis=1,keepdims=True)
+        good=length[:,0]>1e-6
+        if not good.any():return None,None
+        ref=left[np.flatnonzero(good)[0]]/max(length[np.flatnonzero(good)[0],0],1e-9)
+        left=np.where(good[:,None],left/np.maximum(length,1e-9),ref)
+        fwd=np.cross(left,up);fwd[:,1]=0.
+        fwd/=np.maximum(np.linalg.norm(fwd,axis=1,keepdims=True),1e-9)
+        lat=np.cross(up,fwd)
+        lat/=np.maximum(np.linalg.norm(lat,axis=1,keepdims=True),1e-9)
+        return fwd,lat
+    def measure(P,fwd):
+        com=body_com(P)
+        margin=np.full(n,np.nan);theta=np.zeros(n)
+        for t in range(n):
+            ids=[]
+            if active[t,0]:ids.extend((0,1))
+            if active[t,1]:ids.extend((2,3))
+            if not ids:continue
+            q=probes[t,ids];z=q@fwd[t]
+            low,high=float(z.min()),float(z.max());cf=float(com[t]@fwd[t])
+            height=max(float(com[t,1]-q[:,1].mean()),1e-3)
+            margin[t]=min(cf-low,high-cf)
+            theta[t]=math.degrees(math.atan2((low+high)*.5-cf,height))
+        return com,margin,theta
+    fwd,lat=axes(pos)
+    if fwd is None:return root,quat,empty
+    _,margin0,_=measure(pos,fwd)
+    valid0=~np.isnan(margin0)
+    # The pitch pivot must be continuous. Rotating about the pelvis on a
+    # no-contact frame and about the sole on the next frame snaps the root by
+    # the pelvis-to-sole lever arm even when the pitch angle is smooth. Hold
+    # and smooth the support pivot across contact gaps and foot switches.
+    pivot=np.zeros((n,3),np.float64)
+    has_pivot=np.zeros(n,bool)
+    for t in range(n):
+        ids=[]
+        if active[t,0]:ids.extend((0,1))
+        if active[t,1]:ids.extend((2,3))
+        if ids:
+            pivot[t]=probes[t,ids].mean(0);has_pivot[t]=True
+    if has_pivot.any():
+        idx=np.flatnonzero(has_pivot)
+        for k in range(3):
+            pivot[:,k]=gaussian_filter1d(np.interp(np.arange(n),idx,pivot[idx,k]),max(1.,fps*.2),mode='nearest')
+    else:
+        pivot[:]=pos[:,0]
+    total=np.zeros(n,np.float64)
+    applied=0
+    # Deadband is a horizontal distance from the support centre, not a margin
+    # to the nearest edge: a wide double-support interval must not hide a COM
+    # that sits far behind the feet.
+    deadband_deg=math.degrees(math.atan2(deadband,0.85))
+    max_step=0.6  # degrees per frame on the cumulative pitch
+    for _ in range(max(1,int(iterations))):
+        fwd,lat=axes(pos)
+        if fwd is None:break
+        _,margin,theta=measure(pos,fwd)
+        theta=np.where(np.isnan(margin),0.,np.where(theta>deadband_deg,np.clip(theta,0.,max_pitch),0.))
+        theta=gaussian_filter1d(theta,max(1.,fps*.3),mode='nearest')
+        # Do not zero the smoothed pitch on short support gaps: that made the
+        # body snap at the first re-contact frame. Rate-limit the cumulative
+        # pitch instead, so mask boundaries become a short ramp.
+        desired=total+theta
+        for i in range(1,n):
+            desired[i]=min(max(desired[i],desired[i-1]-max_step),desired[i-1]+max_step)
+        theta=desired-total
+        if float(np.abs(theta).max(initial=0.))<.25:break
+        new_pos=pos.copy();new_world=world.copy()
+        for t in range(n):
+            if abs(theta[t])<1e-3:continue
+            R=Rotation.from_rotvec(lat[t]*math.radians(theta[t])).as_matrix()
+            new_pos[t]=pivot[t]+(pos[t]-pivot[t])@R.T
+            new_world[t]=np.einsum('ij,tjk->tik',R,world[t])
+            for foot in range(2):
+                if active[t,foot]:new_world[t,7+foot]=ankle0[t,foot]
+        local,_=solve_legs(rest,new_pos,new_world,new_pos[:,0],targets,active)
+        q=Rotation.from_matrix(local.reshape(-1,3,3)).as_quat().reshape(n,22,4)[...,[3,0,1,2]]
+        pos,world=fk(rest,new_pos[:,0],q)
+        total=desired
+        applied+=1
+    fwd,lat=axes(pos)
+    if fwd is None:return root,quat,empty
+    _,margin1,_=measure(pos,fwd)
+    valid1=~np.isnan(margin1)
+    slip=np.linalg.norm(pos[:,[7,8]]-targets,axis=-1)
+    report=dict(balance=True,balance_frames=int((np.abs(total)>.05).sum()),
+        balance_pitch_mean_deg=float(np.abs(total).mean()),balance_pitch_max_deg=float(np.abs(total).max()),
+        balance_margin_before_mean_m=float(np.mean(margin0[valid0])) if valid0.any() else 0.,
+        balance_margin_after_mean_m=float(np.mean(margin1[valid1])) if valid1.any() else 0.,
+        balance_inside_before_pct=float(100*np.mean(margin0[valid0]>=0)) if valid0.any() else 0.,
+        balance_inside_after_pct=float(100*np.mean(margin1[valid1]>=0)) if valid1.any() else 0.,
+        max_balance_ankle_slip_m=float(slip[active].max()) if active.any() else 0.,
+        balance_iterations=applied,balance_method='Sagittal COM-over-support pitch about the active sole, planted ankles retained')
+    if not applied:return root,quat,report
+    return pos[:,0],q,report
 
 
 def reachable_pelvis_drop(hips, targets, lengths, active):
@@ -290,7 +439,7 @@ airborne intervals, and split anchors when the source intentionally travels.
     return active,anchors,offsets,shift,floor,segments
 
 
-def correct_arrays(rest, root, quat, probes, probabilities, fps=30., floor=None, core=CORE, output=None, emit=lambda *a,**k:None, preset='normal',contact_ranges=None,pelvis_offset=0.,mode='flat',foot_enabled=True):
+def correct_arrays(rest, root, quat, probes, probabilities, fps=30., floor=None, core=CORE, output=None, emit=lambda *a,**k:None, preset='normal',contact_ranges=None,pelvis_offset=0.,mode='flat',foot_enabled=True,balance=True):
     from .correction_settings import correction_options
     pelvis_offset=correction_options({'pelvis_offset':pelvis_offset})['pelvis_offset']
     n=len(root)
@@ -309,6 +458,18 @@ def correct_arrays(rest, root, quat, probes, probabilities, fps=30., floor=None,
         del plan
         plan=prepare_contacts(probes,probabilities,fps,floor,preset,contact_ranges,mode)
     active,anchors,sole_points,shift,floor,segments=plan
+    # Balance uses the same contact evidence even when foot locking is off.
+    # A small dilation only covers the first/last samples of a stance and
+    # short dropouts; it never creates a foot pin.
+    balance_active=active
+    if balance and not balance_active.any():
+        balance_active=prepare_contacts(probes,probabilities,fps,floor,preset,None,mode)[0]
+    balance_probes=probes+shift[:,None,:]
+    if balance:
+        near=balance_probes[...,1].reshape(n,2,2).min(2)<floor+.08
+        span=max(1,round(fps*.13))
+        structure=np.ones((2*span+1,1),bool)
+        balance_active=balance_active|(near&binary_dilation(balance_active,structure=structure))
     out_root,out_quat=output if output is not None else (np.empty_like(root),np.empty_like(quat))
     if n==1:
         out_root[:]=root;out_quat[:]=quat
@@ -449,6 +610,11 @@ def correct_arrays(rest, root, quat, probes, probabilities, fps=30., floor=None,
         rotation_error=max(rotation_error,float(np.rad2deg(Rotation.from_matrix(delta[keep].reshape(-1,3,3)).magnitude()).max()))
         out_root[start:end]=r[keep];out_quat[start:end]=q[keep]
         emit('progress',stage='correct',current=end,total=n,message='Motion Correction: stabilizing ground contacts')
+    balance_report={}
+    if balance:
+        b_root,b_quat,balance_report=balance_pose(rest,out_root,out_quat,balance_probes,balance_active,floor,fps)
+        if balance_report.get('balance'):
+            out_root[:]=b_root;out_quat[:]=b_quat
     report={'version':VERSION,'preset':preset,'mode':mode,'automatic_ranges':automatic_ranges,'frames':n,'fps':fps,'floor':floor,'core_frames':core,'halo_frames':halo,
         'native_seconds':native_seconds,'contacts':int(active.sum()),'segments':segments,
         'max_root_y_offset_m':float(np.abs(shift[:,1]).max()),'max_root_xz_offset_m':float(np.linalg.norm(shift[:,[0,2]],axis=1).max()),'max_contact_goal_error_m':max_goal_error,
@@ -470,6 +636,12 @@ def correct_arrays(rest, root, quat, probes, probabilities, fps=30., floor=None,
         'method':'RGB MoCap Motion Correction; native anatomical contacts; continuous sole support; source global ankle rotations retained',
         'warning':'No confident foot contacts; foot correction was skipped.' if foot_enabled and not active.any() else
                   'Some foot locks remain unresolved; inspect the result.' if max_goal_error>.01 else ''}
+    report.update(balance_report)
+    if balance_report.get('balance'):
+        report['method']=report['method']+'; sagittal COM-over-support balance'
+        if report.get('max_balance_ankle_slip_m',0)>.01:
+            report['warning']=' '.join(filter(None,(report['warning'],
+                'Balance correction moved a planted foot by up to %.1f cm.'%(100*report['max_balance_ankle_slip_m']))))
     adjacent=(transition[1:]|transition[:-1])&(~flight[1:,None])&(~flight[:-1,None])
     speed=np.linalg.norm(np.diff(goal_offsets[...,[0,2]],axis=0),axis=-1)*fps
     report['max_transition_offset_speed_mps']=float(speed[adjacent].max()) if adjacent.any() else 0.
@@ -634,7 +806,7 @@ def run(project,emit,result):
                     probes[start:end]=geometry.sample(roots[start:end],quats[start:end])[0]
                 _,_,report=correct_arrays(geometry.rest[:22],roots,quats,probes,probabilities,fps,floor,
                     output=(out_roots,out_quats),emit=emit,preset=preset,contact_ranges=contact_ranges,
-                    pelvis_offset=options['pelvis_offset'],mode=options['mode'],foot_enabled=options['foot_lock'])
+                    pelvis_offset=options['pelvis_offset'],mode=options['mode'],foot_enabled=options['foot_lock'],balance=options.get('balance',True))
                 from .hand_lock import apply as apply_hands
                 report['hand_lock']=apply_hands(geometry.rest[:22],roots,quats,out_roots,out_quats,geometry.palm_offsets,fps,options['mode'],report['floor'],preset,hand_ranges,options['hand_lock'],emit)
                 report['warning']=' '.join(filter(None,(report['warning'],report['hand_lock']['warning'])))
@@ -677,8 +849,12 @@ def run(project,emit,result):
                         'A non-contact foot penetrates the correction floor; check floor height and contact timing.')))
                 output=dict(params)
                 output['body_pose']=params['body_pose'].clone()
-                for joint in (1,2,4,5,7,8) + ((13,14,16,17,18,19,20,21) if report['hand_lock']['contacts'] else ()):
+                # The contact solver edits legs, but the balance pass also pitches
+                # the pelvis, spine and arms. Publish every local rotation so the
+                # exported motion keeps the corrected sagittal pose.
+                for joint in range(1,22):
                     output['body_pose'][:,3*(joint-1):3*joint]=torch.from_numpy(np.asarray(pose[:,joint]).copy())
+                output['global_orient']=torch.from_numpy(np.asarray(pose[:,0]).copy())
                 output['transl']=torch.from_numpy(np.asarray(translation).copy())
                 begin_update(project,kind,'correct')
                 save_tensor({'smpl_params_global':output,'source':base,'method':report['method']},project/RESULTS[kind][0])

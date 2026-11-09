@@ -107,7 +107,7 @@ def run(project,emit=lambda *a,**k:None,result='corrected_initial'):
     # Mark before publishing any payload; interrupted generations cannot export.
     begin_update(project,kind,'correct')
     out_root,out_quat,report=correct_arrays(geometry.rest[:22],roots,quats,probes,probabilities,fps,floor,
-        preset=options['preset'],contact_ranges=ranges,pelvis_offset=options['pelvis_offset'],mode=options['mode'],foot_enabled=options['foot_lock'],emit=emit)
+        preset=options['preset'],contact_ranges=ranges,pelvis_offset=options['pelvis_offset'],mode=options['mode'],foot_enabled=options['foot_lock'],balance=False,emit=emit)
     from .hand_lock import apply as apply_hands
     report['hand_lock']=apply_hands(geometry.rest[:22],roots,quats,out_root,out_quat,geometry.palm_offsets,fps,options['mode'],report['floor'],options['preset'],hand_ranges,options['hand_lock'],emit)
     report['warning']=' '.join(filter(None,(report['warning'],report['hand_lock']['warning'])))

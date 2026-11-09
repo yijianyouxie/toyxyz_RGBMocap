@@ -319,16 +319,17 @@ def prepare(project, result, emit=lambda *a, **k: None, body=None):
                 # Explicit palm locking may adjust collar/shoulder/elbow. The
                 # torso and wrist world orientations still must match source.
                 hand_enabled=bool(saved.get('options',{}).get('hand_lock',False))
-                preserved_joints=tuple(j for j in upper_joints if not hand_enabled or j not in (13,14,16,17,18,19))
+                preserved_joints=tuple(j for j in upper_joints if j!=0 and (not hand_enabled or j not in (13,14,16,17,18,19)))
                 for start in range(0,n,128):
                     stop=min(n,start+128)
                     pair=[]
                     for values in (base_params,params):
+                        # Compare LOCAL rotations. The sagittal balance is a
+                        # deliberate root pitch: it changes upper-body world
+                        # orientations but must not alter their local pose.
                         angles=torch.cat((values['global_orient'][start:stop,None],values['body_pose'][start:stop].reshape(-1,21,3)),1).numpy()
-                        matrices=Rotation.from_rotvec(angles.reshape(-1,3)).as_matrix().reshape(-1,22,3,3)
-                        for j,p in enumerate(BODY_PARENTS):
-                            if p>=0:matrices[:,j]=matrices[:,p]@matrices[:,j]
-                        pair.append(matrices[:,preserved_joints])
+                        local=Rotation.from_rotvec(angles.reshape(-1,3)).as_matrix().reshape(-1,22,3,3)
+                        pair.append(local[:,preserved_joints])
                     relative=pair[0].swapaxes(-1,-2)@pair[1]
                     source_upper_delta=max(source_upper_delta,float(np.rad2deg(Rotation.from_matrix(relative.reshape(-1,3,3)).magnitude()).max()))
                 report['upper_body_rotation_max_deg'] = source_upper_delta
