@@ -30,6 +30,9 @@ def current(project,kind):
         from .motion_tools import require_supported_project
         require_supported_project(project)
         if float(state.get('fps',30))!=record['fps']:return False
+        # The bind pose depends on the spine switch, not on the source motion.
+        from .correction_settings import correction_options
+        if bool(record.get('spine_straight',True))!=correction_options(state.get('correction',{})).get('spine',True):return False
         from .models import BY_KEY
         if state.get('pipeline',{}).get('model')=='mamma':
             from .mamma_body import body_path
@@ -96,7 +99,7 @@ def prepare(project, result, emit=lambda *a, **k: None, body=None):
         raise MemoryError('Free at least 1.5 GiB RAM to prepare the target preview safely.')
     import torch, smplx
     from scipy.spatial.transform import Rotation
-    from .source_animation import fit,temporal_halo,FIT_VERSION,source_rig,validate,policy
+    from .source_animation import fit,temporal_halo,FIT_VERSION,source_rig,straighten_spine,validate,policy
     from .source_bvh import write_bvh
     from .motion_tools import RESULTS, result_sources, result_is_current, base_result
     from .correction import contact_strength
@@ -133,10 +136,18 @@ def prepare(project, result, emit=lambda *a, **k: None, body=None):
         rest_template = (body_data.J_regressor[:22] @ body_data.v_template).detach().numpy()
         rest_shapes = torch.einsum('jv,vcd->jcd', body_data.J_regressor[:22], body_data.shapedirs).detach().numpy()
         rest = template.joints[0, :22].numpy().copy()
-        rig = source_rig(skeleton(rest, anatomy['joints'], source_anchors=True), rest)
+        from .correction_settings import correction_options
+        straight_spine = correction_options(state.get('correction', {})).get('spine', True)
+        neutral_rest = rest.copy()
+        if straight_spine:
+            # FBX bind and the animation targets share the same rest, so the
+            # fixed-length fit has to see the straightened chain too.
+            straighten_spine(neutral_rest)
+        rig = source_rig(skeleton(rest, anatomy['joints'], source_anchors=True), rest,
+                         straight_spine=straight_spine)
         asset = mannequin(rig, anatomy=anatomy)
         from .fbx_bind import prepare as prepare_fbx_bind
-        fbx_binding=prepare_fbx_bind(rig,rest,anatomy['vertices'],'smplx',fps)
+        fbx_binding=prepare_fbx_bind(rig,neutral_rest,anatomy['vertices'],'smplx',fps)
         token = uuid.uuid4().hex[:12]
         stem = f'{kind}_rig-{token}'
         files = {'frames_file': stem + '.npy', 'joints_file': stem + '-joints.npy', 'reference_joints_file': stem + '-reference.npy', 'asset_file': stem + '-asset.npz', 'bvh_file': stem + '.bvh'}
@@ -192,6 +203,11 @@ def prepare(project, result, emit=lambda *a, **k: None, body=None):
                         g[:, j] = g[:, p] @ g[:, j]
                 betas = params['betas'][begin:stop].numpy() if len(params['betas']) > 1 else np.repeat(params['betas'].numpy(), stop - begin, axis=0)
                 shaped_rest = rest_template + np.einsum('jcd,td->tjc', rest_shapes[..., :betas.shape[1]], betas)
+                if straight_spine:
+                    # The export rig and its targets must share the same bind,
+                    # otherwise the fixed-length fit cannot reach the joints.
+                    for frame_rest in shaped_rest:
+                        straighten_spine(frame_rest)
                 root = params['transl'][begin:stop].numpy() + shaped_rest[:, 0]
                 goals = np.empty((stop - begin, 22, 3))
                 goals[:, 0] = root
@@ -358,7 +374,7 @@ def prepare(project, result, emit=lambda *a, **k: None, body=None):
                 raise ValueError('Frame rate changed while preparing export bones. Retry.')
             from .paths import ROOT
             identity=code_identity()
-            payload = dict(version=VERSION,kind=kind,frames=n,fps=fps,names=rig['names'],sources=sources,**files,
+            payload = dict(version=VERSION,kind=kind,frames=n,fps=fps,names=rig['names'],spine_straight=bool(straight_spine),sources=sources,**files,
                 representation='smplx',source_model=state.get('pipeline',{}).get('model','gvhmr'),
                 model_path=str(model),model_stat=model_stamp,code=identity,
                 code_stats={name:file_stat(ROOT/'mocap'/name) for name in identity},

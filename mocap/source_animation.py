@@ -23,13 +23,40 @@ def temporal_halo(fps=30.):
     return radius(.05) + radius(.035) + 3 * radius(.10) + 12 * radius(.06)
 
 
-def source_rig(original, source_rest):
-    """Keep registered torso/pivots and fingers; straighten only rest limbs."""
+def straighten_spine(rest):
+    """Put the chest joints back on the hips-to-neck line.
+
+    SMPL-X places the chest joints on a dog-leg: spine2->spine3 turns about
+    26 degrees forward and spine3->neck about 11 degrees back. Copied into the
+    export bind, that kink shows in every frame even when the actor stands
+    upright, so the overlay and the BVH bind carry a permanent forward bend.
+    Only the intermediate spine joints move; the hips, neck and head keep
+    their positions and each joint keeps its share of the chain length.
+    """
+    chain = ((0, 3), (3, 6), (6, 9), (9, 12))
+    lengths = [float(np.linalg.norm(rest[b] - rest[a])) for a, b in chain]
+    total = sum(lengths)
+    if total <= 1e-9:
+        return
+    hips = rest[0].copy()
+    span = rest[12] - hips
+    travelled = 0.
+    for joint, length in zip((3, 6, 9), lengths[:3]):
+        travelled += length
+        target = hips + span * (travelled / total)
+        target[0] = rest[joint][0]
+        rest[joint] = target
+
+
+def source_rig(original, source_rest, straight_spine=False):
+    """Keep registered torso/pivots and fingers; straighten rest limbs."""
     rig = {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in original.items()}
     old = rig['rest'].copy()
     rest = rig['rest'] = np.asarray(rig['rest'], dtype=float).copy()
     source_rest = np.asarray(source_rest, dtype=float)
     rest[:22] = source_rest[:22] - source_rest[0]
+    if straight_spine:
+        straighten_spine(rest)
     for hand, ids in ((20, range(22, 37)), (21, range(37, 52))):
         rest[list(ids)] += rest[hand] - old[hand]
     source = rest.copy()

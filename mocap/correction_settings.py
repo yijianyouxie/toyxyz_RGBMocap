@@ -37,7 +37,32 @@ def correction_options(options=None):
     pelvis = float(options.get('pelvis_offset', 0.))
     if not math.isfinite(pelvis) or abs(pelvis) > .25:
         raise ValueError('Pelvis height offset must be between -0.25 and +0.25 meters')
-    return {'auto_floor': auto, 'floor': floor, 'preset': preset, 'pelvis_offset': pelvis, 'mode':mode, 'foot_lock':bool(options.get('foot_lock',True)), 'hand_lock':bool(options.get('hand_lock',False)), 'balance':bool(options.get('balance',True))}
+    return {'auto_floor': auto, 'floor': floor, 'preset': preset, 'pelvis_offset': pelvis, 'mode':mode, 'foot_lock':bool(options.get('foot_lock',True)), 'hand_lock':bool(options.get('hand_lock',False)), 'balance':bool(options.get('balance',True)), 'spine':bool(options.get('spine',True))}
+
+
+def store_options(projects,options):
+    """Write one correction block to every project a correction group owns.
+
+    Apply Correction and Reconstruct 3D both read the block from each project's
+    own manifest, and a people group also keeps one block per take. Updating
+    only the visible project leaves sibling takes (and the group root that seeds
+    new takes) on the previous settings, so their results resurface unchanged.
+    Returns the projects whose file actually changed.
+    """
+    from pathlib import Path
+    import json
+    from .storage import atomic_json
+    value=correction_options(options)
+    changed=[]
+    for project in dict.fromkeys(Path(project) for project in projects):
+        path=project/'project.json'
+        try:state=json.loads(path.read_text(encoding='utf-8'))
+        except (OSError,ValueError):continue
+        if state.get('correction')==value:continue
+        state['correction']=value
+        atomic_json(path,state)
+        changed.append(project)
+    return changed
 
 
 def effective_options(project,state):

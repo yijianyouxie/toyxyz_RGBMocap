@@ -210,6 +210,12 @@ class PeopleWorkspace:
                         self.status.setText(f"{person['name']}: selected base motion is unavailable. Reconstruct it first.");return
                     continue
                 jobs.extend((stage,['--project',str(project),'--result',kind]) for stage in ('correct','export'))
+        # The group root keeps its own clip-level motion, and the clip export
+        # reads it. Refresh it with the same settings so opening the group
+        # project cannot show a motion built from the previous options.
+        bases=result_sources(base_result(kind))
+        if all((self.people_root/RESULTS[base][0]).is_file() and result_is_current(self.people_root,base) for base in bases):
+            jobs.extend((stage,['--project',str(self.people_root),'--result',kind]) for stage in ('correct','export'))
         if not jobs:
             self.status.setText('Reconstruct a person before applying the shared scene floor.');return
         self._people_batch=True
@@ -641,7 +647,7 @@ class PeopleWorkspace:
         for person in selected:
             args=['--project',str(self.people_root),'--person-id',str(person['id']),
                 '--first-frame',str(begin),'--end-frame',str(finish),'--result',self._people_result,
-                '--correction-preset',options['preset'],'--correction-mode',options['mode'],'--foot-lock',str(int(options['foot_lock'])),'--hand-lock',str(int(options['hand_lock'])),'--balance',str(int(options['balance'])),'--pelvis-offset',str(options['pelvis_offset'])]
+                '--correction-preset',options['preset'],'--correction-mode',options['mode'],'--foot-lock',str(int(options['foot_lock'])),'--hand-lock',str(int(options['hand_lock'])),'--balance',str(int(options['balance'])),'--spine',str(int(options['spine'])),'--pelvis-offset',str(options['pelvis_offset'])]
             if not options['auto_floor']:args+=['--floor',str(options['floor'])]
             jobs.append(('person',args))
         self.start_jobs(jobs)

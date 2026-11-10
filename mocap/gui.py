@@ -612,12 +612,24 @@ class MainWindow(PearWorkspace,PromptHMRWorkspace,MammaWorkspace,CharacterWorksp
             from .people_store import safe_child
             projects += [safe_child(self.people_root,take['project']) for person in self.people_state['people']
                 if person.get('checked') for take in person.get('takes',[])]
-        jobs=[]
+        jobs=[];repair=[]
         for project in dict.fromkeys(projects):
             from .flow_placement import needs_update
             placement_old=self.model_choice.currentData()=='flowhmr' and needs_update(project)
-            if (project/RESULTS[base_result(self.active_result)][0]).is_file() and (placement_old or result_is_current(project,self.active_result) and not current(project,self.active_result)):
+            if not (project/RESULTS[base_result(self.active_result)][0]).is_file():continue
+            usable=result_is_current(project,self.active_result)
+            if self.active_result.startswith('corrected_') and not usable:
+                # The selected result no longer matches the correction
+                # options. Preparing a rig would refuse to run, so rebuild the
+                # result instead of silently doing nothing for the click.
+                if project.resolve()==self.project.resolve():repair.append(project)
+                continue
+            if not usable:continue
+            if placement_old or not current(project,self.active_result):
                 jobs.append(('rig',['--project',str(project),'--result',self.active_result]))
+        if repair:
+            jobs=[(stage,['--project',str(project),'--result',self.active_result])
+                  for project in repair for stage in ('correct','export')]+jobs
         if jobs:self.start_jobs(jobs)
 
     def open_model_manager(self):
@@ -986,6 +998,12 @@ class MainWindow(PearWorkspace,PromptHMRWorkspace,MammaWorkspace,CharacterWorksp
         if 'people' not in stages and self._single_actor and not self._single_actor['checked']:
             self.status.setText('Check Person 1 in the People list to reconstruct it.')
             return
+        if 'people' not in stages and self.project is not None and self.people_state is None:
+            # A reopened project can reach this point before the people list is
+            # restored. Reading it back keeps the run on the person takes
+            # instead of silently correcting only the group clip.
+            try:self.sync_people(self.project,json.loads((Path(self.project)/'project.json').read_text(encoding='utf-8')))
+            except (OSError,ValueError):pass
         if 'people' not in stages and self.input_person_jobs(stages,result):
             return
         unavailable = [model for stage in stages for model in ([] if self.model_choice.currentData()=='flowhmr' and stage=='flow_camera' and self.flow_sampling.currentData()==-1 else missing('flow_export' if self.model_choice.currentData()=='flowhmr' and stage in ('correct','export') else stage))]
@@ -1013,6 +1031,7 @@ class MainWindow(PearWorkspace,PromptHMRWorkspace,MammaWorkspace,CharacterWorksp
                                  '--correction-mode',self.correction_mode.currentData(),
                                  '--foot-lock',str(int(self.foot_lock.isChecked())),'--hand-lock',str(int(self.hand_lock.isChecked())),
                                  '--balance',str(int(self.balance.isChecked())),
+                                 '--spine',str(int(self.spine.isChecked())),
                                  '--pelvis-offset',str(self.pelvis_offset.value())]
         self.start_jobs([("prepare", prepare_args)]
                         + [(stage, ["--result", result] if stage in {"export", "flow_export", "footmr", "handflow", "correct"} and result else None) for stage in stages])
@@ -1041,22 +1060,45 @@ class MainWindow(PearWorkspace,PromptHMRWorkspace,MammaWorkspace,CharacterWorksp
         hand=tool.key=='gvhmr' and self.handflow_refine.isChecked()
         self.input_jobs(tool.stages(refine, foot,correction,handflow=hand), result=result_kind(refine, foot,correction,handflow=hand))
 
+    def correction_targets(self):
+        """Every project the correction panel governs.
+
+        A people group keeps one correction block per take, and the group root
+        seeds newly prepared takes. Rewriting only the visible project leaves
+        siblings on their old settings, which then reappear through the shared
+        scene as soon as it reloads.
+        """
+        targets=[self.project] if self.project is not None else []
+        from .people_store import load_people,root_for,safe_child
+        root,state=self.people_root,self.people_state
+        if root is None and self.project is not None:
+            # Saving must not depend on whether the shared scene finished
+            # loading; the manifest itself knows the group.
+            try:
+                root=root_for(self.project);state=state or load_people(root)
+            except (OSError,ValueError):root=state=None
+        if root is None:return list(dict.fromkeys(targets))
+        targets.append(root)
+        for person in (state or {}).get('people',[]):
+            for take in person.get('takes',[]):
+                targets.append(safe_child(root,take['project']))
+        return list(dict.fromkeys(targets))
+
     def save_correction_options(self):
-        if self.project is not None:
-            if self.people_root is not None:
-                from .scene_floor import save_config
-                save_config(self.people_root,self.selected_correction_options())
-            from .storage import atomic_json
-            path=self.project/'project.json';state=json.loads(path.read_text(encoding='utf-8'))
-            state['correction']=self.selected_correction_options()
-            atomic_json(path,state)
+        from .correction_settings import store_options
+        options=self.selected_correction_options()
+        store_options(self.correction_targets(),options)
+        if self.people_root is not None:
+            from .scene_floor import save_config
+            save_config(self.people_root,options)
+        return options
 
     def selected_correction_options(self):
         from .correction_settings import correction_options
         return correction_options({'auto_floor':self.auto_floor.isChecked(),'floor':self.floor_height.value(),
                                    'mode':self.correction_mode.currentData(),'foot_lock':self.foot_lock.isChecked(),'hand_lock':self.hand_lock.isChecked(),
                                    'preset':self.correction_preset.currentData(),'pelvis_offset':self.pelvis_offset.value(),
-                                   'balance':self.balance.isChecked()})
+                                   'balance':self.balance.isChecked(),'spine':self.spine.isChecked()})
 
     def update_correction_description(self):
         descriptions = {
@@ -1073,12 +1115,12 @@ class MainWindow(PearWorkspace,PromptHMRWorkspace,MammaWorkspace,CharacterWorksp
     def restore_correction_options(self, options):
         from .correction_settings import correction_options
         options=correction_options(options)
-        controls=(self.correction_mode,self.correction_preset,self.auto_floor,self.floor_height,self.pelvis_offset,self.foot_lock,self.hand_lock,self.balance)
+        controls=(self.correction_mode,self.correction_preset,self.auto_floor,self.floor_height,self.pelvis_offset,self.foot_lock,self.hand_lock,self.balance,self.spine)
         for control in controls:control.blockSignals(True)
         try:
             self.correction_preset.setCurrentIndex(self.correction_preset.findData(options['preset']))
             self.correction_mode.setCurrentIndex(self.correction_mode.findData(options['mode']))
-            self.foot_lock.setChecked(options['foot_lock']);self.hand_lock.setChecked(options['hand_lock']);self.balance.setChecked(options['balance'])
+            self.foot_lock.setChecked(options['foot_lock']);self.hand_lock.setChecked(options['hand_lock']);self.balance.setChecked(options['balance']);self.spine.setChecked(options['spine'])
             self.auto_floor.setChecked(options['auto_floor']);self.floor_height.setValue(options['floor'])
             self.pelvis_offset.setValue(options['pelvis_offset'])
         finally:
