@@ -335,7 +335,13 @@ def prepare(project, result, emit=lambda *a, **k: None, body=None):
                 # Explicit palm locking may adjust collar/shoulder/elbow. The
                 # torso and wrist world orientations still must match source.
                 hand_enabled=bool(saved.get('options',{}).get('hand_lock',False))
-                preserved_joints=tuple(j for j in upper_joints if j!=0 and (not hand_enabled or j not in (13,14,16,17,18,19)))
+                # Head posture is also a declared local edit, but only when the
+                # correction recorded one; everything else stays source-exact.
+                head_edit=bool(saved.get('head_posture')) and float(saved.get('head_posture_bias_deg',0.))>0.
+                relaxed=set()
+                if hand_enabled:relaxed.update((13,14,16,17,18,19))
+                if head_edit:relaxed.update((12,15))
+                preserved_joints=tuple(j for j in upper_joints if j!=0 and j not in relaxed)
                 for start in range(0,n,128):
                     stop=min(n,start+128)
                     pair=[]
@@ -350,6 +356,7 @@ def prepare(project, result, emit=lambda *a, **k: None, body=None):
                     source_upper_delta=max(source_upper_delta,float(np.rad2deg(Rotation.from_matrix(relative.reshape(-1,3,3)).magnitude()).max()))
                 report['upper_body_rotation_max_deg'] = source_upper_delta
                 report['source_preserved_rotation_joints']=list(preserved_joints)
+                report['source_head_posture_bias_deg']=float(saved.get('head_posture_bias_deg',0.))
                 if source_upper_delta > 0.01:
                     raise ValueError('Source correction changed inferred upper-body rotations. Preview not committed.')
             del selected_reference, selected_errors

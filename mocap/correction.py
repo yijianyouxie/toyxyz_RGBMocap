@@ -25,6 +25,15 @@ HALO_SECONDS = 4.0
 # is yawed away from the camera the pitch shows up as a sideways drift in a
 # fixed front view, so bound the cumulative pitch by the yaw. 0 disables it.
 _LEAN_CAP_K = 1.0
+# The neck-to-head pitch barely moves a head-on silhouette: rotating the head
+# about the lateral axis displaces it along the view ray. A frontal monocular
+# fit can therefore settle tens of degrees forward for a whole take (measured:
+# 34 degrees on the Valentine clip against 6 on the regression clip). Treat the
+# take median as a posture bias, not as motion: one constant angle cannot
+# introduce a temporal artefact, and clamping per frame would flatten real nods.
+_HEAD_PITCH_THRESHOLD = 10.
+_HEAD_PITCH_MAX = 25.
+_HEAD_NECK_SHARE = .45
 
 
 def backend():
@@ -113,6 +122,55 @@ def _knee_guard_beta(rest,root,q_raw,q_fix,pos_raw):
         if not viol.any():break
         beta[viol]*=.6
     return beta
+
+
+def _head_pitch(rot):
+    """Signed head pitch about the chest's lateral axis, in degrees.
+
+    Uses the chest frame, not world axes: the actor turns, so pitch has to be
+    measured against the torso it belongs to. Positive means chin forward.
+    """
+    up=rot[:,9][:,:,1];fwd=rot[:,9][:,:,2];head=rot[:,15][:,:,1]
+    return np.degrees(np.arctan2(np.sum(head*fwd,axis=1),np.sum(head*up,axis=1)))
+
+
+def normalize_head_pitch(quat,fps=30.):
+    """Neutralise a take-wide forward head pitch bias on the neck and head.
+
+    Edits the quaternions in place and returns report fields. Only the neck and
+    head rotate; the root, hips and everything the contacts pin stay exact. The
+    head is a child of the neck, so it takes the full angle while the neck takes
+    its share, and each keeps its own local articulation.
+    """
+    empty=dict(head_posture=False,head_posture_bias_deg=0.,
+               head_pitch_before_median_deg=0.,head_pitch_after_median_deg=0.)
+    n=len(quat)
+    # One second is the shortest window where a median describes posture
+    # rather than a single pose.
+    if n<max(2,int(round(fps))):return empty
+    # The stored quaternions are local joint rotations; pitch needs the global
+    # chest and head frames, so compose the chain (the same order fk uses).
+    local=Rotation.from_quat(np.asarray(quat)[...,[1,2,3,0]].reshape(-1,4)).as_matrix().reshape(n,22,3,3)
+    rot=local.copy()
+    for j in range(1,22):rot[:,j]=rot[:,PARENTS[j]]@local[:,j]
+    before=_head_pitch(rot)
+    bias=float(np.clip(np.median(before)-_HEAD_PITCH_THRESHOLD,0.,_HEAD_PITCH_MAX))
+    report=dict(empty,head_pitch_before_median_deg=float(np.median(before)),
+                head_pitch_before_max_deg=float(before.max()),head_pitch_after_median_deg=float(np.median(before)),
+                head_pitch_after_max_deg=float(before.max()))
+    if bias<=1e-3:return report
+    up=rot[:,9][:,:,1];fwd=rot[:,9][:,:,2]
+    axis=np.cross(up,fwd);axis/=np.maximum(np.linalg.norm(axis,axis=1,keepdims=True),1e-9)
+    rot[:,12]=Rotation.from_rotvec(axis*np.radians(-bias*_HEAD_NECK_SHARE)).as_matrix()@rot[:,12]
+    rot[:,15]=Rotation.from_rotvec(axis*np.radians(-bias)).as_matrix()@rot[:,15]
+    local[:,12]=np.transpose(rot[:,9],(0,2,1))@rot[:,12]
+    local[:,15]=np.transpose(rot[:,12],(0,2,1))@rot[:,15]
+    quat[...,[1,2,3,0]]=Rotation.from_matrix(local.reshape(-1,3,3)).as_quat().reshape(n,22,4)
+    after=_head_pitch(rot)
+    report.update(head_posture=True,head_posture_bias_deg=bias,
+                  head_pitch_after_median_deg=float(np.median(after)),
+                  head_pitch_after_max_deg=float(after.max()))
+    return report
 
 
 def balance_pose(rest,root,quat,probes,active,floor,fps,max_pitch=12.,deadband=.02,iterations=3,max_total=10.,reach_allow=.03):
@@ -920,6 +978,13 @@ def run(project,emit,result):
                 from .hand_lock import apply as apply_hands
                 report['hand_lock']=apply_hands(geometry.rest[:22],roots,quats,out_roots,out_quats,geometry.palm_offsets,fps,options['mode'],report['floor'],preset,hand_ranges,options['hand_lock'],emit)
                 report['warning']=' '.join(filter(None,(report['warning'],report['hand_lock']['warning'])))
+                # After balance: the head is a COM term, so neutralising it before
+                # the pitch solve would change every balance figure.
+                if options.get('head',True):
+                    posture=normalize_head_pitch(out_quats,fps)
+                    report.update(posture)
+                    if posture.get('head_posture'):
+                        report['method']=report['method']+'; take-wide neck/head pitch neutralised about the chest axis'
                 report['contact_revision']=contact_revision
                 if shared:report['shared_floor']=shared
                 if contact_warning:report['warning']=' '.join(filter(None,(report['warning'],contact_warning)))

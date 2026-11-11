@@ -1,6 +1,6 @@
 # 交接文档：ExMR 修正链路（重心 / 脊柱 / 膝跳 / 大腿防瞬转 / 正视图右倾）
 
-更新日期：2026-11-11
+更新日期：2026-11-11（第 11 节：颈-头前倾同批落地）
 范围：`H:\MyProject\toyxyz_RGBMocap` 的 `correct`（动作修正）与 `export`（Mixamo/FBX 导出）阶段；配套网页端在 `F:\Comfy-Desktop\ComfyUI-Installs\Comfy-MotionCapture`
 读者：接手继续做修复开发的同学。前几轮的分析、回归验证与膝盖重建已落地到产品代码（`d968284`），**本轮新增的"正视图右倾"修复与本文档同批入库**；文档同步更新到落地后的状态，历史实验记录保留供查根因。
 
@@ -8,7 +8,7 @@
 
 ## 1. 一句话现状
 
-四条线**全部落地**：**重心偏后**（sagittal balance）、**脊柱前倾**（Straighten Spine）、**balance 引发的膝跳**（情人节 145/200 帧）、**正视图右倾**（见第 6 节）。膝跳采用"源片极向继承 + 弯曲量恢复 + 全帧 kink 回归保护"，随后修掉膝盖重建带出的**大腿瞬间转动**，代价是 `_POLE_STRENGTH=0.25` 在"修膝跳"和"稳大腿"之间取偏稳一侧（详见 5.6 / 5.7）。正视图右倾采用**侧身感知的逐帧俯仰上限 + 限速后置**（`_LEAN_CAP_K=1.0`），把 women_dance 首尾帧右倾增量从 +7.5° / +4.2° 压到 +2.6° / +2.8°，代价是 WD 支撑面内占比 −5.3pt；`balance=False` 逐帧零差异。
+五条线**全部落地**：**重心偏后**（sagittal balance）、**脊柱前倾**（Straighten Spine）、**balance 引发的膝跳**（情人节 145/200 帧）、**正视图右倾**（见第 6 节）。膝跳采用"源片极向继承 + 弯曲量恢复 + 全帧 kink 回归保护"，随后修掉膝盖重建带出的**大腿瞬间转动**，代价是 `_POLE_STRENGTH=0.25` 在"修膝跳"和"稳大腿"之间取偏稳一侧（详见 5.6 / 5.7）。正视图右倾采用**侧身感知的逐帧俯仰上限 + 限速后置**（`_LEAN_CAP_K=1.0`），把 women_dance 首尾帧右倾增量从 +7.5° / +4.2° 压到 +2.6° / +2.8°，代价是 WD 支撑面内占比 −5.3pt；`balance=False` 逐帧零差异。第五线程**颈-头前倾**（`head` 选项，见第 11 节）同批落地：情人节导出 BVH 的 Head 世界俯仰 36.9°→11.4°，WD 零改动（md5 相同）。
 
 ---
 
@@ -367,3 +367,58 @@ D 系列失败原因：限速是"先扣押、后释放"，门控在弯曲量阈�
 5. `corrected_initial.pt` 含 `smpl_params_global.body_pose`（21 关节 axis-angle），可直接算局部旋转帧间转角；`corrected_initial_joints.npz` 只有位置，且要 `export_project` 之后才更新（见 5.4 坑一）
 6. 改 `_POLE_STRENGTH` 前先跑 `sweep_scale.py` 看取舍曲线：修膝跳与稳大腿是同一个自由度，只有折中、没有两全
 7. 评估"正视图右倾"要用**固定世界正视图**的右倾角（`atan2(head_x−pelvis_x, head_y−pelvis_y)`）并取**勾选减不勾选的增量**，不要看绝对角：源片人物侧身 + 前倾，绝对投影角本就有 ±30°。调 `_LEAN_CAP_K` 前先跑 `sweep_cap.py` 看取舍；改 `desired` 计算顺序时务必保持限速循环在最后，否则 `room` 硬裁剪会突破 0.6°/帧
+
+---
+
+## 11. 线程五：颈-头前倾（已落地，2026-11-11）
+
+### 11.1 现象与根因
+
+情人节导出后**头部明显前倾（下颌内收、面部朝下）**，women_dance 几乎没有。定位结论：**问题在 ExMR 的 `body_pose`（Neck/Head 两个局部旋转），与修正链路、导出 retarget 都无关**。
+
+- 情人节 take 保存的选项是 `balance=false / spine=false / foot_lock=false`，`initial_joints.npz` 与 `corrected_initial_joints.npz` 最大差 2.4e-7 m —— 用户看到的就是原始推理结果。
+- 颈局部前俯 **+18.0°**、头局部前俯 **+16.5°**（相对 Spine3 / Neck）；women_dance 只有 +1.6° / +3.9°。
+- 用胸廓坐标系测「头骨上轴相对胸廓的前俯角 p」：情人节中位 **+37.5°**（91% 帧 >15°，p05 也有 +7.2°），women_dance 中位 +3.5°；导出 BVH 的 Head 骨骼世界俯仰 36.9° vs 4.9°。
+- 跨 6 个项目、3 个引擎共 15 条结果，p 中位全部落在 −13.4° ~ +14.6°；同一段视频换 flowHMR 重建，中位仍是 +26.7°。**两个引擎同时偏**，说明不是单模型 bug，而是该素材把这条自由度推到了极端。
+- 外观原因：角色是风格化 CG，发量 + 头顶大蝴蝶结让头部剪影远大于颅骨，脸小无五官细节，高领/颈环遮挡颈部边界；正面机位下绕侧向轴的颈-头俯仰几乎不改变 2D 投影（位移沿视线），回归器只能用「略低头」的先验解释剪影。women_dance 是无发无遮挡的人偶、颈部裸露、比例接近 SMPL-X，证据足够钉在 0 附近。
+
+### 11.2 方案：整片偏置回正
+
+不做逐帧钳制（会压缩真实低头，women_dance 有 31% 帧 p>15° 是真实动作），而是把**片级中位数当作姿态偏置**：
+
+```
+p(t)  = atan2( (R15·Y)·(R9·Z), (R15·Y)·(R9·Y) )      # 头相对胸廓，R 为全局旋转
+b     = clip(median(p) − 10°, 0, 25°)                  # 片级偏置；b≤0 原样返回
+axis  = normalize( (R9·Y) × (R9·Z) )                   # 该帧胸廓侧向轴
+R12  <- Rot(axis, −0.45b) · R12                        # 颈
+R15  <- Rot(axis, −1.00b) · R15                        # 头（子节点继承颈旋转）
+```
+
+常量（`mocap/correction.py:27` 附近）：`_HEAD_PITCH_THRESHOLD=10.`、`_HEAD_PITCH_MAX=25.`、`_HEAD_NECK_SHARE=.45`。分摊依据是该片段「骨轴（决定头的位置）」超额约 15°、「头骨朝向」超额约 19°。
+
+> 坑一：`correct_arrays` 返回的四元数是**局部**旋转，必须先按 `PARENTS` 合成全局链再测 p，改完再反解回局部（`L12=R9ᵀR12`、`L15=R12ᵀR15`）。直接当全局用，量到的是「头相对颈」的局部角（16.4°），偏置只会算出 6.4°。
+> 坑二：`mixamo_data` 有「上体局部旋转不得改变」的硬校验（`Source correction changed inferred upper-body rotations`），12/15 也在其中。处理方式同 `hand_lock`：只有报告里确实记了 `head_posture` 且偏置 > 0 时，才把 12/15 从 `preserved_joints` 排除，并把偏置写进导出报告（`source_head_posture_bias_deg`）；其余关节仍严格比对（实测 `upper_body_rotation_max_deg=7.5e-06`）。
+
+### 11.3 开关与位置
+
+- 新选项 `head`（默认 **true**），与 balance/spine 平级；网页端复选框 `exmrHead`（"头部姿态回正 Head Posture"），桌面端复选框 `Head Posture`。
+- 施加点在 `correction.run()` 中 `correct_arrays` 与 hand_lock 之后、写 `body_pose` 之前。**必须在 balance 之后**：`body_com` 含 Head 关节（权重 0.081），先动头会改掉每个 balance 报告字段。
+- 缓存：`correction.py` / `mixamo_data.py` 都在 `worker.fingerprint('correct')` 与 `mixamo_data.code_identity()` 里，改代码即失效；`result_is_current` 另外全量比对 `correction_report.options`（已含 `head`）。未 bump `VERSION`。
+
+### 11.4 真实链路验证（`correction.run` + `export_project`，副本）
+
+| 指标 | 情人节 head=off | 情人节 head=on | women_dance off / on |
+| --- | --- | --- | --- |
+| `head_posture_bias_deg` | 不写入 | **25.0** | 0.0（不施加） |
+| p 中位 | 37.54° | **12.54°** | 3.49° / 3.49° |
+| 导出 BVH Head 世界俯仰（均） | 36.93° | **11.42°** | 4.91° / 4.91° |
+| 导出 BVH Neck 世界俯仰（均） | 21.30° | **9.96°** | 0.65° / 0.65° |
+| 关节对拍 off vs on | — | 仅 15 号头关节位移，最大 3.18 cm；0–14、16–21 全 0.00 cm | **0.000000 cm** |
+| BVH 通道差 | — | 仅 Neck 11.25°、Head 13.75°，root 0.0 | **md5 相同** |
+| `balance_*` 字段 | — | 逐字段相同 | 逐字段相同 |
+
+- **零回归**：women_dance 的偏置为 0，函数提前返回，导出文件与 head=off 逐字节相同。
+- 全片扫描（阈值 10°、上限 25°）：15 条结果里只有情人节被改（−25° / flowHMR −16.7°），last_year_summer 的两个引擎被削 0.1–4.6°，其余全为 0。
+- 残留：修正后 p 中位仍有 +12.5°，视觉上是「轻微前倾但自然」；想更狠把 `_HEAD_PITCH_MAX` 调到 30°。对「整段真实低头」的素材会过度回正，最多 25°（本库现有素材没有这种情况）。
+- 详细分析、复现脚本与对比图见 `docs/分析_情人节头部前倾.md`。
+

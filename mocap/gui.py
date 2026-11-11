@@ -1032,6 +1032,7 @@ class MainWindow(PearWorkspace,PromptHMRWorkspace,MammaWorkspace,CharacterWorksp
                                  '--foot-lock',str(int(self.foot_lock.isChecked())),'--hand-lock',str(int(self.hand_lock.isChecked())),
                                  '--balance',str(int(self.balance.isChecked())),
                                  '--spine',str(int(self.spine.isChecked())),
+                                 '--head',str(int(self.head.isChecked())),
                                  '--pelvis-offset',str(self.pelvis_offset.value())]
         self.start_jobs([("prepare", prepare_args)]
                         + [(stage, ["--result", result] if stage in {"export", "flow_export", "footmr", "handflow", "correct"} and result else None) for stage in stages])
@@ -1098,7 +1099,8 @@ class MainWindow(PearWorkspace,PromptHMRWorkspace,MammaWorkspace,CharacterWorksp
         return correction_options({'auto_floor':self.auto_floor.isChecked(),'floor':self.floor_height.value(),
                                    'mode':self.correction_mode.currentData(),'foot_lock':self.foot_lock.isChecked(),'hand_lock':self.hand_lock.isChecked(),
                                    'preset':self.correction_preset.currentData(),'pelvis_offset':self.pelvis_offset.value(),
-                                   'balance':self.balance.isChecked(),'spine':self.spine.isChecked()})
+                                   'balance':self.balance.isChecked(),'spine':self.spine.isChecked(),
+                                   'head':self.head.isChecked()})
 
     def update_correction_description(self):
         descriptions = {
@@ -1115,12 +1117,12 @@ class MainWindow(PearWorkspace,PromptHMRWorkspace,MammaWorkspace,CharacterWorksp
     def restore_correction_options(self, options):
         from .correction_settings import correction_options
         options=correction_options(options)
-        controls=(self.correction_mode,self.correction_preset,self.auto_floor,self.floor_height,self.pelvis_offset,self.foot_lock,self.hand_lock,self.balance,self.spine)
+        controls=(self.correction_mode,self.correction_preset,self.auto_floor,self.floor_height,self.pelvis_offset,self.foot_lock,self.hand_lock,self.balance,self.spine,self.head)
         for control in controls:control.blockSignals(True)
         try:
             self.correction_preset.setCurrentIndex(self.correction_preset.findData(options['preset']))
             self.correction_mode.setCurrentIndex(self.correction_mode.findData(options['mode']))
-            self.foot_lock.setChecked(options['foot_lock']);self.hand_lock.setChecked(options['hand_lock']);self.balance.setChecked(options['balance']);self.spine.setChecked(options['spine'])
+            self.foot_lock.setChecked(options['foot_lock']);self.hand_lock.setChecked(options['hand_lock']);self.balance.setChecked(options['balance']);self.spine.setChecked(options['spine']);self.head.setChecked(options['head'])
             self.auto_floor.setChecked(options['auto_floor']);self.floor_height.setValue(options['floor'])
             self.pelvis_offset.setValue(options['pelvis_offset'])
         finally:
