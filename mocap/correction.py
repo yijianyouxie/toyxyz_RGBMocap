@@ -79,15 +79,52 @@ def body_com(positions):
     return com/np.maximum(total,1e-9)
 
 
-def balance_pose(rest,root,quat,probes,active,floor,fps,max_pitch=12.,deadband=.02,iterations=3):
-    """Rotate the sagittal pose forward until the COM sits over the support.
+def _blend_quat(a,b,beta):
+    """Per-frame blend of two (w,x,y,z) quaternion arrays."""
+    bb=np.where((a*b).sum(-1,keepdims=True)<0.,-b,b)
+    q=a*(1.-beta[:,None,None])+bb*beta[:,None,None]
+    return q/np.maximum(np.linalg.norm(q,axis=-1,keepdims=True),1e-12)
+
+
+def _knee_guard_beta(rest,root,q_raw,q_fix,pos_raw):
+    """Roll back the knee repair on any frame where it adds a >0.5cm kink.
+
+    The contact mask has gaps, so this has to look at the full take rather
+    than only the frames solve_legs touched: a repaired frame can change the
+    kink of a neighbour that was never repaired.
+    """
+    n=len(root)
+    def kk(p,k):
+        j=p[:,k]
+        return np.linalg.norm(j[1:-1]-(j[:-2]+j[2:])/2,axis=1)*100
+    base=(kk(pos_raw,4),kk(pos_raw,5))
+    beta=np.ones(n)
+    for _ in range(60):
+        p,_=fk(rest,root,_blend_quat(q_raw,q_fix,beta))
+        viol=np.zeros(n,bool)
+        for k,b in zip((4,5),base):
+            for i in np.flatnonzero(kk(p,k)-b>.5):
+                t=i+1
+                viol[max(0,t-1):min(n,t+2)]=True
+        if not viol.any():break
+        beta[viol]*=.6
+    return beta
+
+
+def balance_pose(rest,root,quat,probes,active,floor,fps,max_pitch=12.,deadband=.02,iterations=3,max_total=10.,reach_allow=.03):
+    """Rotate the sagittal pose toward the centre of the foot support.
 
     The source of the bias is monocular depth ambiguity: a front camera
     cannot distinguish a vertical leg from a slightly foreshortened one.
     A 1-2 percent leg-length mismatch therefore becomes an 8 degree lean.
-    This pass only corrects a backward (COM behind support) lean. It keeps
-    planted ankles at their corrected world positions and keeps active ankle
-    orientations unchanged, so the soles stay flat and do not skate.
+    The pitch is a target, not an accumulator: it falls back when the COM is
+    already ahead of the support, and it never exceeds max_total. Where the
+    rotated hip would stretch a planted leg past its length (plus reach_allow)
+    the pitch is capped, so the solver does not have to slide the foot.
+    Planted ankles keep their corrected world positions and active ankle
+    orientations, so the soles stay flat and do not skate. The anchor fades in
+    and out over a few frames instead of switching, so contact boundaries do
+    not snap the leg.
     """
     from .anatomical_ik import solve_legs
     n=len(root)
@@ -96,6 +133,7 @@ def balance_pose(rest,root,quat,probes,active,floor,fps,max_pitch=12.,deadband=.
                balance_inside_before_pct=0.,balance_inside_after_pct=0.,max_balance_ankle_slip_m=0.)
     if n<2 or not active.any():return root,quat,empty
     pos,world=fk(rest,root,quat)
+    reference=pos.copy()
     targets=pos[:,[7,8]].copy()
     ankle0=world[:,[7,8]].copy()
     up=np.array([0.,1.,0.])
@@ -147,6 +185,35 @@ def balance_pose(rest,root,quat,probes,active,floor,fps,max_pitch=12.,deadband=.
             pivot[:,k]=gaussian_filter1d(np.interp(np.arange(n),idx,pivot[idx,k]),max(1.,fps*.2),mode='nearest')
     else:
         pivot[:]=pos[:,0]
+    # The support mask is binary, so the ankle pin used to switch on and off
+    # inside one frame and the leg snapped at every contact boundary. Fade the
+    # pin instead: the anchor weight ramps over a few frames while the middle
+    # of a stance keeps a full pin. The target follows the source ankle every
+    # frame, so a soft tail after lift-off does not drag the foot.
+    weight=np.clip(gaussian_filter1d(active.astype(np.float64),max(1.,fps*.05),axis=0,mode='nearest'),0.,1.)
+    # A pinned ankle leaves the leg range once the pose is pitched. Cap the
+    # pitch where the rotated hip would pull a support leg past its length
+    # plus reach_allow, so the solver never has to slide the foot. Frames whose
+    # source pose is already out of range keep their source reach, not worse.
+    raw_room=np.full(n,np.inf)
+    if reach_allow is not None and max_total>0:
+        steps=np.arange(.5,max_total+.5,.5)
+        for foot,(hip,knee,ankle) in enumerate(((1,4,7),(2,5,8))):
+            ids=np.flatnonzero(active[:,foot])
+            if not len(ids):continue
+            length=np.linalg.norm(rest[knee]-rest[hip])+np.linalg.norm(rest[ankle]-rest[knee])
+            for t in ids:
+                allowed=max(length+reach_allow,float(np.linalg.norm(pos[t,hip]-targets[t,foot])))
+                rotation=Rotation.from_rotvec(lat[t][None,:]*np.radians(steps)[:,None]).as_matrix()
+                hip_path=pivot[t]+np.einsum('dij,j->di',rotation,pos[t,hip]-pivot[t])
+                distance=np.linalg.norm(hip_path-targets[t,foot],axis=1)
+                over=np.flatnonzero(distance>allowed)
+                if len(over):raw_room[t]=min(raw_room[t],float(steps[over[0]]-.5))
+    # A foot entering support can drop the cap by several degrees at once;
+    # smooth the bound so the hard clamp below cannot snap the body.
+    room=np.full(n,max_total)
+    if np.isfinite(raw_room).any():
+        room=gaussian_filter1d(np.minimum(np.where(np.isfinite(raw_room),raw_room,max_total),max_total),max(1.,fps*.1),mode='nearest')
     total=np.zeros(n,np.float64)
     applied=0
     # Deadband is a horizontal distance from the support centre, not a margin
@@ -158,14 +225,18 @@ def balance_pose(rest,root,quat,probes,active,floor,fps,max_pitch=12.,deadband=.
         fwd,lat=axes(pos)
         if fwd is None:break
         _,margin,theta=measure(pos,fwd)
-        theta=np.where(np.isnan(margin),0.,np.where(theta>deadband_deg,np.clip(theta,0.,max_pitch),0.))
+        # Correct a backward lean and release a forward one with the same
+        # bound; a one-way accumulator kept the pitch wound up after the COM
+        # had already passed the support centre.
+        theta=np.where(np.isnan(margin),0.,np.where(np.abs(theta)>deadband_deg,np.clip(theta,-max_pitch,max_pitch),0.))
         theta=gaussian_filter1d(theta,max(1.,fps*.3),mode='nearest')
         # Do not zero the smoothed pitch on short support gaps: that made the
         # body snap at the first re-contact frame. Rate-limit the cumulative
         # pitch instead, so mask boundaries become a short ramp.
-        desired=total+theta
+        desired=np.clip(total+theta,0.,max_total)
         for i in range(1,n):
             desired[i]=min(max(desired[i],desired[i-1]-max_step),desired[i-1]+max_step)
+        desired=np.minimum(desired,room)
         theta=desired-total
         if float(np.abs(theta).max(initial=0.))<.25:break
         new_pos=pos.copy();new_world=world.copy()
@@ -175,12 +246,40 @@ def balance_pose(rest,root,quat,probes,active,floor,fps,max_pitch=12.,deadband=.
             new_pos[t]=pivot[t]+(pos[t]-pivot[t])@R.T
             new_world[t]=np.einsum('ij,tjk->tik',R,world[t])
             for foot in range(2):
-                if active[t,foot]:new_world[t,7+foot]=ankle0[t,foot]
-        local,_=solve_legs(rest,new_pos,new_world,new_pos[:,0],targets,active)
+                w=float(weight[t,foot])
+                if w<=1e-6:continue
+                if w>=1.-1e-6:
+                    new_world[t,7+foot]=ankle0[t,foot]
+                else:
+                    # Blend the ankle frame so the foot does not twist as the
+                    # pin fades in or out.
+                    qa=Rotation.from_matrix(new_world[t,7+foot]).as_quat()
+                    qb=Rotation.from_matrix(ankle0[t,foot]).as_quat()
+                    if float(np.dot(qa,qb))<0.:qb=-qb
+                    qs=(1.-w)*qa+w*qb;qs/=max(float(np.linalg.norm(qs)),1e-9)
+                    new_world[t,7+foot]=Rotation.from_quat(qs).as_matrix()
+        # Partial anchors aim between the rotated ankle and the source ankle,
+        # so the leg pose moves continuously through a contact boundary.
+        blend=targets+(new_pos[:,[7,8]]-targets)*(1.-weight[...,None])
+        pin=(weight>.02)&(np.abs(theta)[:,None]>1e-4)
+        last_inputs=(new_pos,new_world,blend,pin)
+        local,_=solve_legs(rest,new_pos,new_world,new_pos[:,0],blend,pin)
         q=Rotation.from_matrix(local.reshape(-1,3,3)).as_quat().reshape(n,22,4)[...,[3,0,1,2]]
         pos,world=fk(rest,new_pos[:,0],q)
         total=desired
         applied+=1
+    if applied:
+        # One repair pass on the last iteration's inputs, so the guard's
+        # "unrepaired" baseline is exactly the pre-repair output of the take.
+        np_,nw_,bl_,pn_=last_inputs
+        local_raw,_=solve_legs(rest,np_,nw_,np_[:,0],bl_,pn_)
+        local_fix,_=solve_legs(rest,np_,nw_,np_[:,0],bl_,pn_,reference=reference)
+        q_raw=Rotation.from_matrix(local_raw.reshape(-1,3,3)).as_quat().reshape(n,22,4)[...,[3,0,1,2]]
+        q_fix=Rotation.from_matrix(local_fix.reshape(-1,3,3)).as_quat().reshape(n,22,4)[...,[3,0,1,2]]
+        pos_raw,_=fk(rest,np_[:,0],q_raw)
+        beta=_knee_guard_beta(rest,np_[:,0],q_raw,q_fix,pos_raw)
+        q=_blend_quat(q_raw,q_fix,beta)
+        pos,world=fk(rest,np_[:,0],q)
     fwd,lat=axes(pos)
     if fwd is None:return root,quat,empty
     _,margin1,_=measure(pos,fwd)
@@ -193,7 +292,9 @@ def balance_pose(rest,root,quat,probes,active,floor,fps,max_pitch=12.,deadband=.
         balance_inside_before_pct=float(100*np.mean(margin0[valid0]>=0)) if valid0.any() else 0.,
         balance_inside_after_pct=float(100*np.mean(margin1[valid1]>=0)) if valid1.any() else 0.,
         max_balance_ankle_slip_m=float(slip[active].max()) if active.any() else 0.,
-        balance_iterations=applied,balance_method='Sagittal COM-over-support pitch about the active sole, planted ankles retained')
+        balance_reach_capped_frames=int(np.isfinite(raw_room).sum()),
+        balance_total_cap_frames=int((total>=max_total-1e-6).sum()),
+        balance_iterations=applied,balance_method='Sagittal COM-over-support pitch about the active sole, planted ankles retained and faded at contact boundaries, total pitch capped and released against support reach')
     if not applied:return root,quat,report
     return pos[:,0],q,report
 
