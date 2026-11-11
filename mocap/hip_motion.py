@@ -237,16 +237,12 @@ def absorb_vertical(record, body, bend=1.0, fps=30.0):
     return transl, new_body_pose
 
 
-def match_video(record, body_path, sway=1.0, bob=1.0, fps=30.0):
-    """World translation whose root follows the video, with the excursion gains applied.
-
-    `record` is the ExMR record that is about to be saved as hmr4d_results.pt, so it holds
-    both spaces. Every downstream consumer (correction, BVH, npz, preview) reads this one
-    translation and therefore agrees.
+def match_video(record, body_path, sway=1.0, bend=1.0, fps=30.0):
+    """(transl, body_pose) whose root follows the video and whose knees absorb
+    the vertical bob. sway scales the horizontal excursion; bend the knee depth.
     """
-    for key, limit in (("sway", sway), ("bob", bob)):
-        if not np.isfinite(limit) or not GAIN_LIMITS[0] <= limit <= GAIN_LIMITS[1]:
-            raise ValueError(f"Hip {key} gain must be within {GAIN_LIMITS[0]}-{GAIN_LIMITS[1]}")
+    if not GAIN_LIMITS[0] <= sway <= GAIN_LIMITS[1]:
+        raise ValueError(f"Hip sway gain must be within {GAIN_LIMITS[0]}-{GAIN_LIMITS[1]}")
     world = record["smpl_params_global"]
     camera = record["smpl_params_incam"]
     body = _body(body_path, CHUNK)
@@ -254,4 +250,11 @@ def match_video(record, body_path, sway=1.0, bob=1.0, fps=30.0):
     camera_root = _pelvis(body, camera)
     followed = follow_camera_root(world["transl"], world_root, camera_root,
                                   world["global_orient"], camera["global_orient"], fps)
-    return scale_excursion(followed, sway, bob)
+    followed = scale_excursion(followed, sway, 1.0)  # 垂直不再缩放，交给 bend
+    # apply the knee absorption on the record that will be saved
+    import torch
+    record_work = dict(record)
+    record_work["smpl_params_global"] = dict(world)
+    record_work["smpl_params_global"]["transl"] = torch.from_numpy(followed).to(world["transl"].dtype)
+    transl, body_pose = absorb_vertical(record_work, body, bend, fps)
+    return transl, body_pose
