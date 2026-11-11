@@ -154,13 +154,17 @@ def _forward_aa(rest, root, abs_aa):
     return positions, rotations
 
 
-def _camera_axis(record):
-    """Per-frame world horizontal direction the body faces (local +Z), which the
-    knees bow toward. Following the body (not a fixed world -Z) keeps the bend
-    natural through turns and travel; for a head-on take the two coincide."""
+def _camera_axis(record, fps=30.0):
+    """Per-frame body-forward (local +Z) world horizontal direction, sign-aligned
+    and low-passed. SMPL-X global_orient flips ~180 deg through turns, which the
+    knee bow must not follow; align signs across frames, then smooth."""
     orient = np.asarray(record["smpl_params_global"]["global_orient"], np.float64)
     R = Rotation.from_rotvec(orient.reshape(-1, 3)).as_matrix()
     fwd = R @ np.array([0.0, 0.0, 1.0])
+    for t in range(1, len(fwd)):
+        if fwd[t] @ fwd[t - 1] < 0.0:
+            fwd[t] = -fwd[t]
+    fwd = _gaussian(fwd, 0.3 * fps)
     fwd[:, 1] = 0.0
     n = np.linalg.norm(fwd, axis=1, keepdims=True)
     return fwd / np.maximum(n, 1e-12)
@@ -227,13 +231,26 @@ def absorb_vertical(record, body, bend=1.0, fps=30.0):
     # floor: lowest sole low-passed; foot rises 3.4 cm vs 12.9 cm pelvis, treated planted
     foot_low = np.minimum(positions[:, 10, 1], positions[:, 11, 1])
     ground = _gaussian(foot_low[:, None], SOLE_SECONDS * fps)[:, 0]
+    # 根高度回退：follow 可能把骨盆抬到腿伸直都够不到脚底的高度（实测超腿长
+    # 4.8 cm）。按「腿长 + 踝脚底 + 视频脚趾踮脚 3.4 cm」作物理上限，整体下沉根
+    # （所有帧同一常量，不改骨盆抬升 ptp），让脚趾保留约 3.4 cm 的踮脚而非悬空。
+    l1 = np.linalg.norm(rest[4] - rest[1]); l2 = np.linalg.norm(rest[7] - rest[4])
+    ankle_foot = abs(rest[7, 1] - rest[10, 1])
+    max_reach = l1 + l2 + ankle_foot + 0.034  # 0.034 = 视频脚趾踮脚参考
+    pelvis_ground = positions[:, 0, 1] - ground
+    over = float(max(0.0, pelvis_ground.max() - max_reach))
+    if over > 0.0:
+        transl = transl - np.array([0.0, over, 0.0])
+        positions, world = _forward_aa(rest, transl, abs_aa)
+        foot_low = np.minimum(positions[:, 10, 1], positions[:, 11, 1])
+        ground = _gaussian(foot_low[:, None], SOLE_SECONDS * fps)[:, 0]
     targets = np.empty((n, 2, 3))
     for foot, (ankle_i, foot_i) in enumerate(((7, 10), (8, 11))):
         offset = positions[:, ankle_i, 1] - positions[:, foot_i, 1]
         targets[:, foot] = positions[:, ankle_i].copy()
         planted = ground + offset
         targets[:, foot, 1] = positions[:, ankle_i, 1] + bend * (planted - positions[:, ankle_i, 1])
-    camera_axis = _camera_axis(record)
+    camera_axis = _camera_axis(record, fps)
     local = _plant_legs_toward_camera(rest, positions, world, targets, camera_axis)
     new_abs = Rotation.from_matrix(local.reshape(-1, 3, 3)).as_rotvec().reshape(n, 22, 3)
     new_body_pose = (new_abs[:, 1:22] - mean[1:22]).reshape(n, 63)
