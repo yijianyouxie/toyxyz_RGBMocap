@@ -40,7 +40,7 @@ CHUNK = 256
 BEND_LIMITS = (0.0, 1.0)
 # Foot reference: the take's lowest sole, low-passed, is the floor. The foot
 # rises only 3.4 cm against a 12.9 cm pelvis excursion, so treat it as planted.
-SOLE_SECONDS = 1.0
+SOLE_SECONDS = 0.3
 # SMPL-X 22-joint parent list, copied from correction.PARENTS to avoid importing
 # correction (which pulls the KimodoMotionCorrection .pyd chain into the exmr worker).
 _LEG_PARENTS = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19]
@@ -155,12 +155,15 @@ def _forward_aa(rest, root, abs_aa):
 
 
 def _camera_axis(record):
-    """World horizontal direction from the body toward the camera (head-on = -Z)."""
-    rotation = _matrix(record["smpl_params_global"]["global_orient"][0]) @ \
-               _matrix(record["smpl_params_incam"]["global_orient"][0]).T
-    view = -(rotation.T @ np.array([0.0, 0.0, 1.0]))
-    view[1] = 0.0
-    return view / np.maximum(np.linalg.norm(view), 1e-12)
+    """Per-frame world horizontal direction the body faces (local +Z), which the
+    knees bow toward. Following the body (not a fixed world -Z) keeps the bend
+    natural through turns and travel; for a head-on take the two coincide."""
+    orient = np.asarray(record["smpl_params_global"]["global_orient"], np.float64)
+    R = Rotation.from_rotvec(orient.reshape(-1, 3)).as_matrix()
+    fwd = R @ np.array([0.0, 0.0, 1.0])
+    fwd[:, 1] = 0.0
+    n = np.linalg.norm(fwd, axis=1, keepdims=True)
+    return fwd / np.maximum(n, 1e-12)
 
 
 def _plant_legs_toward_camera(rest, positions, world, targets, camera_axis):
@@ -183,7 +186,7 @@ def _plant_legs_toward_camera(rest, positions, world, targets, camera_axis):
         D = np.linalg.norm(dvec, axis=1)
         D = np.clip(D, abs(l1 - l2), 0.999 * (l1 + l2))
         d = dvec / np.maximum(D, 1e-12)[:, None]
-        nv = camera_axis[None, :] - (d @ camera_axis)[:, None] * d
+        nv = camera_axis - (d * camera_axis).sum(1, keepdims=True) * d
         nn = np.linalg.norm(nv, axis=1, keepdims=True)
         nv = np.where(nn > 1e-9, nv / np.maximum(nn, 1e-12), np.zeros_like(nv))
         s = (l1 ** 2 - l2 ** 2 + D ** 2) / (2 * D)
