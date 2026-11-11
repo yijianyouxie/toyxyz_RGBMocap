@@ -21,6 +21,10 @@ PARENTS = [-1,0,0,0,1,2,3,4,5,6,7,8,9,9,9,12,13,14,16,17,18,19]
 VERSION = 9
 CORE = 1024
 HALO_SECONDS = 4.0
+# Sagittal pitch is applied about the body's left-right axis. When that axis
+# is yawed away from the camera the pitch shows up as a sideways drift in a
+# fixed front view, so bound the cumulative pitch by the yaw. 0 disables it.
+_LEAN_CAP_K = 1.0
 
 
 def backend():
@@ -214,6 +218,9 @@ def balance_pose(rest,root,quat,probes,active,floor,fps,max_pitch=12.,deadband=.
     room=np.full(n,max_total)
     if np.isfinite(raw_room).any():
         room=gaussian_filter1d(np.minimum(np.where(np.isfinite(raw_room),raw_room,max_total),max_total),max(1.,fps*.1),mode='nearest')
+    # The left-right axis comes from the source pose; pitching about it leaves
+    # its horizontal direction unchanged, so the yaw bound is stable per pass.
+    cap=max_total*(1.-_LEAN_CAP_K*np.abs(lat[:,2])) if _LEAN_CAP_K else max_total
     total=np.zeros(n,np.float64)
     applied=0
     # Deadband is a horizontal distance from the support centre, not a margin
@@ -233,10 +240,12 @@ def balance_pose(rest,root,quat,probes,active,floor,fps,max_pitch=12.,deadband=.
         # Do not zero the smoothed pitch on short support gaps: that made the
         # body snap at the first re-contact frame. Rate-limit the cumulative
         # pitch instead, so mask boundaries become a short ramp.
-        desired=np.clip(total+theta,0.,max_total)
+        desired=np.clip(total+theta,0.,cap)
+        desired=np.minimum(desired,room)
+        # Rate-limit last: the yaw cap and the support-reach bound are both hard
+        # clamps, and either can otherwise break the per-frame step.
         for i in range(1,n):
             desired[i]=min(max(desired[i],desired[i-1]-max_step),desired[i-1]+max_step)
-        desired=np.minimum(desired,room)
         theta=desired-total
         if float(np.abs(theta).max(initial=0.))<.25:break
         new_pos=pos.copy();new_world=world.copy()
@@ -293,7 +302,7 @@ def balance_pose(rest,root,quat,probes,active,floor,fps,max_pitch=12.,deadband=.
         balance_inside_after_pct=float(100*np.mean(margin1[valid1]>=0)) if valid1.any() else 0.,
         max_balance_ankle_slip_m=float(slip[active].max()) if active.any() else 0.,
         balance_reach_capped_frames=int(np.isfinite(raw_room).sum()),
-        balance_total_cap_frames=int((total>=max_total-1e-6).sum()),
+        balance_total_cap_frames=int((total>=np.asarray(cap)-1e-6).sum()),
         balance_iterations=applied,balance_method='Sagittal COM-over-support pitch about the active sole, planted ankles retained and faded at contact boundaries, total pitch capped and released against support reach')
     if not applied:return root,quat,report
     return pos[:,0],q,report
