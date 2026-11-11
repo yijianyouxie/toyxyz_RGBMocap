@@ -495,6 +495,10 @@ class MainWindow(PearWorkspace,PromptHMRWorkspace,MammaWorkspace,CharacterWorksp
         self.flow_acceleration.setEnabled(not self.busy)
         self.exmr_camera.setEnabled(not self.busy)
         self.exmr_smoothing.setEnabled(not self.busy)
+        self.exmr_hip_motion.setEnabled(not self.busy)
+        hip_enabled=not self.busy and self.exmr_hip_motion.isChecked()
+        for gain in (self.exmr_hip_sway,self.exmr_hip_bob):
+            gain.setEnabled(hip_enabled)
         self.flowhmr_background.setEnabled(not self.busy)
         self.exmr_background.setEnabled(not self.busy)
         self.analyze_button.setVisible(tool.key=='gvhmr')
@@ -692,6 +696,9 @@ class MainWindow(PearWorkspace,PromptHMRWorkspace,MammaWorkspace,CharacterWorksp
             self.flow_gpu_crop.setChecked(True)
             self.exmr_camera.setCurrentIndex(0)
             self.exmr_smoothing.setChecked(True)
+            self.exmr_hip_motion.setChecked(False)
+            self.exmr_hip_sway.setValue(1.)
+            self.exmr_hip_bob.setValue(1.)
             self.camera_tools.restore_background({})
             self.handflow_refine.blockSignals(True)
             self.handflow_refine.setChecked(self.model_choice.currentData()=='gvhmr')
@@ -800,6 +807,9 @@ class MainWindow(PearWorkspace,PromptHMRWorkspace,MammaWorkspace,CharacterWorksp
         exmr=saved_exmr(project,manifest)
         self.exmr_camera.setCurrentIndex(self.exmr_camera.findData(exmr['static_camera']))
         self.exmr_smoothing.setChecked(exmr['smoothing']=='global')
+        self.exmr_hip_motion.setChecked(exmr['hip_motion'])
+        self.exmr_hip_sway.setValue(exmr['hip_sway_gain'])
+        self.exmr_hip_bob.setValue(exmr['hip_bob_gain'])
         self.flow_sampling.setCurrentIndex(max(0,self.flow_sampling.findData(saved_interval(project,manifest))))
         self.model_choice.blockSignals(True)
         self.model_choice.setCurrentIndex(self.model_choice.findData(pipeline.get('model','gvhmr')))
@@ -1037,6 +1047,14 @@ class MainWindow(PearWorkspace,PromptHMRWorkspace,MammaWorkspace,CharacterWorksp
         self.start_jobs([("prepare", prepare_args)]
                         + [(stage, ["--result", result] if stage in {"export", "flow_export", "footmr", "handflow", "correct"} and result else None) for stage in stages])
 
+    def exmr_selected_options(self):
+        """ExMR settings as they travel to the worker, in one place for save and run."""
+        return {'static_camera':self.exmr_camera.currentData(),
+                'smoothing':'global' if self.exmr_smoothing.isChecked() else 'none',
+                'hip_motion':self.exmr_hip_motion.isChecked(),
+                'hip_sway_gain':round(self.exmr_hip_sway.value(),3),
+                'hip_bob_gain':round(self.exmr_hip_bob.value(),3)}
+
     def run_analysis(self):
         self.input_jobs(["track", "pva"])
 
@@ -1047,7 +1065,7 @@ class MainWindow(PearWorkspace,PromptHMRWorkspace,MammaWorkspace,CharacterWorksp
         if tool.key=='exmr' and self.people_root is not None:
             from .storage import atomic_json
             path=self.people_root/'project.json';state=json.loads(path.read_text(encoding='utf-8'))
-            state['exmr_options']={'static_camera':self.exmr_camera.currentData(),'smoothing':'global' if self.exmr_smoothing.isChecked() else 'none'}
+            state['exmr_options']=self.exmr_selected_options()
             atomic_json(path,state)
         if tool.key=='flowhmr' and self.people_root is not None:
             from .storage import atomic_json
@@ -1404,7 +1422,7 @@ class MainWindow(PearWorkspace,PromptHMRWorkspace,MammaWorkspace,CharacterWorksp
         environment.insert('RGB_MOCAP_FLOW_FAST_SAM','1' if self.fast_sam.isChecked() else '0')
         environment.insert('RGB_MOCAP_FLOW_BATCH4','1' if self.flow_batch4.isChecked() else '0')
         environment.insert('RGB_MOCAP_FLOW_GPU_CROP','1' if self.flow_gpu_crop.isChecked() else '0')
-        environment.insert('RGB_MOCAP_EXMR_OPTIONS',json.dumps({'static_camera':self.exmr_camera.currentData(),'smoothing':'global' if self.exmr_smoothing.isChecked() else 'none'}))
+        environment.insert('RGB_MOCAP_EXMR_OPTIONS',json.dumps(self.exmr_selected_options()))
         self.process.setProcessEnvironment(environment)
         self.process.readyReadStandardOutput.connect(self.read_stdout)
         self.process.readyReadStandardError.connect(self.read_stderr)
