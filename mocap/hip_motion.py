@@ -154,37 +154,47 @@ def _forward_aa(rest, root, abs_aa):
     return positions, rotations
 
 
-def _plant_legs_toward_camera(rest, positions, world, targets):
-    """Two-bone IK: ankles to targets, knees bowed toward the camera (fixed +flex).
+def _camera_axis(record):
+    """World horizontal direction from the body toward the camera (head-on = -Z)."""
+    rotation = _matrix(record["smpl_params_global"]["global_orient"][0]) @ \
+               _matrix(record["smpl_params_incam"]["global_orient"][0]).T
+    view = -(rotation.T @ np.array([0.0, 0.0, 1.0]))
+    view[1] = 0.0
+    return view / np.maximum(np.linalg.norm(view), 1e-12)
 
-    Returns local rotation matrices (n,22,3,3), the body_pose in matrix form.
+
+def _plant_legs_toward_camera(rest, positions, world, targets, camera_axis):
+    """Two-bone IK: ankles to targets, knees bowed toward camera_axis.
+
+    The target knee K = H + s*d + h*n with n the camera_axis projected off the
+    hip-ankle axis; align solves the UpLeg/Leg so the ankle lands exactly on the
+    target (no phase flip, no length error). Returns local rotations (n,22,3,3).
     """
     n = len(positions)
     local = world.copy()
     for j, p in enumerate(_LEG_PARENTS):
         if p >= 0:
             local[:, j] = world[:, p].swapaxes(-1, -2) @ world[:, j]
-    original = local.copy()
     for foot, (hip, knee, ankle) in enumerate(((1, 4, 7), (2, 5, 8))):
         upper = rest[knee] - rest[hip]; lower = rest[ankle] - rest[knee]
-        calibration = align([0, -1, 0], upper)
-        axis = calibration @ np.array([1., 0, 0])
-        v = np.einsum('tij,j->ti', original[:, knee], lower)
-        dot = v @ axis; perpendicular = v - dot[:, None] * axis
-        a = perpendicular @ upper; b = np.cross(axis, v) @ upper
-        constant = (upper @ axis) * dot
-        radius = np.hypot(a, b)
-        delta = targets[:, foot] - positions[:, hip]
-        distance = np.linalg.norm(delta, axis=1)
-        desired = (distance ** 2 - upper @ upper - lower @ lower) * .5 - constant
-        flex = np.minimum(np.arccos(np.clip(desired / np.maximum(radius, 1e-12), -1, 1)), np.deg2rad(160))
-        correction = flex  # fixed positive: knee bows toward the camera (world -Z), no phase flip
-        bend = Rotation.from_rotvec(correction[:, None] * axis).as_matrix()
-        knee_local = bend @ original[:, knee]
-        end_vector = upper + np.einsum('tij,j->ti', knee_local, lower)
+        l1 = np.linalg.norm(upper); l2 = np.linalg.norm(lower)
+        H = positions[:, hip]; A = targets[:, foot]
+        dvec = A - H
+        D = np.linalg.norm(dvec, axis=1)
+        D = np.clip(D, abs(l1 - l2), 0.999 * (l1 + l2))
+        d = dvec / np.maximum(D, 1e-12)[:, None]
+        nv = camera_axis[None, :] - (d @ camera_axis)[:, None] * d
+        nn = np.linalg.norm(nv, axis=1, keepdims=True)
+        nv = np.where(nn > 1e-9, nv / np.maximum(nn, 1e-12), np.zeros_like(nv))
+        s = (l1 ** 2 - l2 ** 2 + D ** 2) / (2 * D)
+        h = np.sqrt(np.maximum(0, l1 ** 2 - s ** 2))
+        K = H + s[:, None] * d + h[:, None] * nv
         hip_world = world[:, hip].copy()
         for t in range(n):
-            hip_world[t] = align(hip_world[t] @ end_vector[t], delta[t]) @ hip_world[t]
+            hip_world[t] = align(world[t, hip] @ upper, K[t] - H[t]) @ world[t, hip]
+        knee_local = np.empty((n, 3, 3))
+        for t in range(n):
+            knee_local[t] = align(lower, hip_world[t].T @ (A[t] - K[t]))
         local[:, hip] = world[:, _LEG_PARENTS[hip]].swapaxes(-1, -2) @ hip_world
         local[:, knee] = knee_local
         local[:, ankle] = (hip_world @ knee_local).swapaxes(-1, -2) @ world[:, ankle]
@@ -220,7 +230,8 @@ def absorb_vertical(record, body, bend=1.0, fps=30.0):
         targets[:, foot] = positions[:, ankle_i].copy()
         planted = ground + offset
         targets[:, foot, 1] = positions[:, ankle_i, 1] + bend * (planted - positions[:, ankle_i, 1])
-    local = _plant_legs_toward_camera(rest, positions, world, targets)
+    camera_axis = _camera_axis(record)
+    local = _plant_legs_toward_camera(rest, positions, world, targets, camera_axis)
     new_abs = Rotation.from_matrix(local.reshape(-1, 3, 3)).as_rotvec().reshape(n, 22, 3)
     new_body_pose = (new_abs[:, 1:22] - mean[1:22]).reshape(n, 63)
     return transl, new_body_pose
