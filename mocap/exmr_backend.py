@@ -333,7 +333,8 @@ def run_stage(project,stage,result,emit,force=False,feature_phase=None):
             from .hip_motion import match_video
             emit('progress',current=0,total=0,message='ExMR: match the video hip amplitude')
             corrected, body_pose = match_video(record, BY_KEY['smplx'].path,
-                float(config['hip_sway_gain']), float(config['hip_bob_gain']), state['fps'])
+                float(config['hip_sway_gain']), float(config['hip_bob_gain']), state['fps'],
+                load(project/'exmr_keypoints.pt'), native['K_fullimg'])
             translation = record['smpl_params_global']['transl']
             record['smpl_params_global']['transl'] = torch.from_numpy(corrected).to(translation.dtype)
             record['smpl_params_global']['body_pose'] = torch.from_numpy(body_pose).to(translation.dtype)

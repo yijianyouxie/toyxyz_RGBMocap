@@ -103,6 +103,25 @@ def link_assets(engine):
             shutil.copy2(model.path,p)
 
 
+def ensure_hub_cache(work):
+    """Offline torch.hub cache for the engine's deeplabv3_resnet50 load.
+
+    torch.hub.load('pytorch/vision:v0.10.0', ...) validates through the GitHub
+    API and downloads a zipball unless the repo dir already exists in hub_dir.
+    Planting the repo dir and the exact official weight keeps that call offline.
+    TORCH_HOME is per-project, so this must run for every work folder.
+    """
+    import shutil
+    from .paths import ROOT
+    src=ROOT/'assets/prompthmr_torch_hub';hub=work/'torch-cache/hub'
+    for rel in ('pytorch_vision_v0.10.0/hubconf.py','checkpoints/deeplabv3_resnet50_coco-cd0a2569.pth'):
+        s=src/rel;d=hub/rel
+        if d.is_file() and d.stat().st_size==s.stat().st_size:continue
+        d.parent.mkdir(parents=True,exist_ok=True);d.unlink(missing_ok=True)
+        try:os.link(s,d)
+        except OSError:shutil.copy2(s,d)
+
+
 def save_result(value,target):
     import joblib
     tmp=target.with_name(target.name+'.'+uuid.uuid4().hex+'.tmp')
@@ -128,6 +147,7 @@ def inference(stage,job,engine):
     announce(stage,requested_mode(),'PromptHMR keeps the validated one-image batch and full temporal context in both modes. Additional block offloading is not implemented; actual RAM/VRAM guards remain active.',emit)
     os.chdir(engine);sys.path.insert(0,str(engine))
     os.environ.update(TORCH_HOME=str(work/'torch-cache'),HF_HOME=str(work/'hf-cache'),MPLCONFIGDIR=str(work/'mpl-cache'),YOLO_CONFIG_DIR=str(work/'yolo-cache'))
+    ensure_hub_cache(work)
     from pipeline import Pipeline
     pipe=Pipeline(static_cam=True);pipe.cfg.num_max_people=job['options']['people'] or 8
     pipe.images,pipe.seq_folder=pipe.load_frames(str(work/'input.mp4'),str(work/'frames'))

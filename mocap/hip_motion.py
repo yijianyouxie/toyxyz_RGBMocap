@@ -7,9 +7,10 @@ its own vertical rhythm: the exported root can differ from the video by a quarte
 horizontally and be out of phase vertically.
 
 ```match_video``` replaces the exported root with the camera-frame root, which is the one
-fitted to the frames, and then optionally scales the remaining excursion about the take
-median. Poses, joint rotations and the world frame are untouched: only the root translation
-changes, so the caller has to run it before the BVH is written.
+fitted to the frames, scales the remaining excursion about the take median, and then refits
+the legs (UpLeg/Leg) from the video 2D keypoints so the knees squat-and-straighten in the
+sagittal plane instead of bowing toward the camera. Only the root translation and the leg
+rotations change, so the caller has to run it before the BVH is written.
 """
 from __future__ import annotations
 
@@ -20,8 +21,13 @@ from .mixamo_rig import align
 
 # The camera-frame root is a per-frame image fit. The image pins the height and the horizontal
 # placement, so the pose can absorb a sway: that axis arrives with the fit's ripple (about twice
-# the keypoints' own fast sway on the Valentine take). One frame of smoothing keeps the sway.
-HORIZONTAL_FRAMES = 1.0
+# the keypoints' own fast sway on the Valentine take). Two frames of smoothing keep the sway
+# without letting the ripple read as a side-to-side jitter.
+HORIZONTAL_FRAMES = 2.0
+# The height is pinned hard in the image, but the per-frame fit still carries a
+# frame-to-frame ripple that reads as a vertical bounce after the root follows it;
+# two frames of Gaussian sigma remove it without cutting the ~1.5 s hip rhythm.
+VERTICAL_FRAMES = 2.0
 # The depth is the axis the fit is least sure about, and a vertical bounce is ambiguous with
 # moving toward the camera: the Valentine take swings 0.20 m of depth inside 0.6 s of a hip lift
 # that really lifts 0.10 m. That reads as the character lunging at the camera and buries the bob.
@@ -32,15 +38,25 @@ GAIN_LIMITS = (0.2, 3.0)
 # Frames per forward pass; longer takes are processed in blocks to bound the mesh memory.
 CHUNK = 256
 
-# The knee bends about the body's left-right axis (sagittal flexion). ExMR's
-# legs are ~98.5% straight, so its own per-frame knee pole (phase) is noise that
-# flips the bend toward/away from the camera 18-21 times a take. Dropping the
-# phase and fixing the flex sign keeps the knee bowed toward the camera (world
-# -Z for a head-on take), which is the only bend visible in the 2D.
+# The 2D-driven leg refit mixes the optimized sagittal knee bend toward the
+# ExMR original: 0 keeps ExMR's legs, 1 replaces the UpLeg/Leg rotations with
+# the 2D fit. The range is shared with exmr_options through BEND_LIMITS.
 BEND_LIMITS = (0.0, 1.0)
-# Foot reference: the take's lowest sole, low-passed, is the floor. The foot
-# rises only 3.4 cm against a 12.9 cm pelvis excursion, so treat it as planted.
-SOLE_SECONDS = 0.3
+# COCO knee keypoints sit on the patella's lower front while SMPL knee joints
+# sit on the femur-tibia centre; the thigh angular distance is systematically
+# ~7.8% longer (a constant offset, not motion-coupled). Shorten the video knee
+# along the hip->knee direction before the 2D fit.
+KNEE_CORR = 1.0 / 1.078
+# Residual scales for refit_legs (the sagittal knee refit).
+REFIT_V_SIGMA = 8.0      # thigh projection v alignment (px)
+REFIT_LEN_SIGMA = 0.06   # soft shin-length prior (relative)
+REFIT_FLEX_SIGMA = 1.0   # flexion-angle prior (rad)
+# The sagittal flexion must not push the knee behind the hip (a backward bend);
+# a positive z excess is penalised hard, so the knee stays forward of the hip.
+REFIT_FORWARD_SIGMA = 0.05
+# 2D keypoint noise makes the per-frame flexion jitter; low-pass the fitted
+# angles along time. This is frames of Gaussian sigma, so the ~1.5 s squat rhythm survives.
+REFIT_SMOOTH_FRAMES = 2.0
 # SMPL-X 22-joint parent list, copied from correction.PARENTS to avoid importing
 # correction (which pulls the KimodoMotionCorrection .pyd chain into the exmr worker).
 _LEG_PARENTS = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19]
@@ -61,10 +77,11 @@ def _gaussian(values, sigma):
 
 
 def _camera_path(camera, fps):
-    """The camera-frame root with its ripple removed: horizontal lightly, depth heavily."""
+    """The camera-frame root with its ripple removed: horizontal and vertical lightly, depth heavily."""
     horizontal = _gaussian(camera[:, :1], HORIZONTAL_FRAMES)[:, 0]
+    vertical = _gaussian(camera[:, 1:2], VERTICAL_FRAMES)[:, 0]
     depth = _gaussian(camera[:, 2:3], DEPTH_SECONDS * fps)[:, 0]
-    return np.stack([horizontal, camera[:, 1], depth], axis=1)
+    return np.stack([horizontal, vertical, depth], axis=1)
 
 
 def _matrix(axis_angle):
@@ -136,6 +153,31 @@ def scale_excursion(transl, sway=1.0, bob=1.0):
     return center + (np.asarray(transl, np.float64) - center) * gain
 
 
+def _bob_gain(camera_root, keypoints, K, fps=30.0):
+    """Vertical root gain that restores the video's pelvis height excursion.
+
+    The camera-frame pelvis projection keeps the video's phase but the monocular
+    fit compresses its height; the video/projection v peak-to-peak ratio is the
+    missing gain (about 1.16 on the Valentine take). The projection is measured
+    on the same smoothed path the root follows, so the gain is auto-calibrated,
+    not hand-tuned; a flat take (no excursion) leaves the root untouched.
+    """
+    keypoints = keypoints.detach().cpu().numpy() if hasattr(keypoints, "detach") else np.asarray(keypoints)
+    keypoints = np.asarray(keypoints, np.float64)
+    K = K.detach().cpu().numpy() if hasattr(K, "detach") else np.asarray(K)
+    K = np.asarray(K, np.float64)
+    if K.ndim == 3:
+        K = K[0]
+    fy, cy = K[1, 1], K[1, 2]
+    camera = _camera_path(np.asarray(camera_root, np.float64), fps)
+    projection = fy * camera[:, 1] / camera[:, 2] + cy
+    pelvis_v = (keypoints[:, 11, 1] + keypoints[:, 12, 1]) / 2
+    span = float(np.ptp(projection))
+    if span < 1e-3:
+        return 1.0
+    return float(np.clip(np.ptp(pelvis_v) / span, GAIN_LIMITS[0], GAIN_LIMITS[1]))
+
+
 def _rest_joints(body, betas):
     """22-joint shape-dependent rest, same as correction.SoleGeometry."""
     shaped = body.v_template.numpy() + np.einsum('vci,i->vc', body.shapedirs.numpy(), betas)
@@ -154,112 +196,110 @@ def _forward_aa(rest, root, abs_aa):
     return positions, rotations
 
 
-def _camera_axis(record, fps=30.0):
-    """Per-frame body-forward (local +Z) world horizontal direction, sign-aligned
-    and low-passed. SMPL-X global_orient flips ~180 deg through turns, which the
-    knee bow must not follow; align signs across frames, then smooth."""
-    orient = np.asarray(record["smpl_params_global"]["global_orient"], np.float64)
-    R = Rotation.from_rotvec(orient.reshape(-1, 3)).as_matrix()
-    fwd = R @ np.array([0.0, 0.0, 1.0])
-    for t in range(1, len(fwd)):
-        if fwd[t] @ fwd[t - 1] < 0.0:
-            fwd[t] = -fwd[t]
-    fwd = _gaussian(fwd, 0.3 * fps)
-    fwd[:, 1] = 0.0
-    n = np.linalg.norm(fwd, axis=1, keepdims=True)
-    return fwd / np.maximum(n, 1e-12)
+def refit_legs(record, body, keypoints, K, fps=30.0, drive=1.0):
+    """Refit the legs from the video 2D keypoints, replacing ExMR's camera-bowed
+    knees with a sagittal flexion that follows the 2D.
 
+    ExMR keeps the legs nearly straight vertically and explains the hip bob as a
+    knee bend toward the camera. The 2D knee keypoints still carry the real
+    squat-then-straighten rhythm, so each leg is refit per frame by rotating the
+    knee about the body's left-right axis: the thigh projection follows the video
+    (corrected for the COCO-knee/SMPL-knee definition offset) under a soft shin-
+    length and flexion prior. The ankle stays put, so the feet keep their spacing.
 
-def _plant_legs_toward_camera(rest, positions, world, targets, camera_axis):
-    """Two-bone IK: ankles to targets, knees bowed toward camera_axis.
-
-    The target knee K = H + s*d + h*n with n the camera_axis projected off the
-    hip-ankle axis; align solves the UpLeg/Leg so the ankle lands exactly on the
-    target (no phase flip, no length error). Returns local rotations (n,22,3,3).
+    drive blends the fitted knees toward ExMR: 0 returns the input body_pose, 1
+    replaces the UpLeg/Leg rotations entirely. Returns body_pose (n, 63).
     """
-    n = len(positions)
-    local = world.copy()
-    for j, p in enumerate(_LEG_PARENTS):
-        if p >= 0:
-            local[:, j] = world[:, p].swapaxes(-1, -2) @ world[:, j]
-    for foot, (hip, knee, ankle) in enumerate(((1, 4, 7), (2, 5, 8))):
-        upper = rest[knee] - rest[hip]; lower = rest[ankle] - rest[knee]
-        l1 = np.linalg.norm(upper); l2 = np.linalg.norm(lower)
-        H = positions[:, hip]; A = targets[:, foot]
-        dvec = A - H
-        D = np.linalg.norm(dvec, axis=1)
-        D = np.clip(D, abs(l1 - l2), 0.999 * (l1 + l2))
-        d = dvec / np.maximum(D, 1e-12)[:, None]
-        nv = camera_axis - (d * camera_axis).sum(1, keepdims=True) * d
-        nn = np.linalg.norm(nv, axis=1, keepdims=True)
-        nv = np.where(nn > 1e-9, nv / np.maximum(nn, 1e-12), np.zeros_like(nv))
-        s = (l1 ** 2 - l2 ** 2 + D ** 2) / (2 * D)
-        h = np.sqrt(np.maximum(0, l1 ** 2 - s ** 2))
-        K = H + s[:, None] * d + h[:, None] * nv
-        hip_world = world[:, hip].copy()
-        for t in range(n):
-            hip_world[t] = align(world[t, hip] @ upper, K[t] - H[t]) @ world[t, hip]
-        knee_local = np.empty((n, 3, 3))
-        for t in range(n):
-            knee_local[t] = align(lower, hip_world[t].T @ (A[t] - K[t]))
-        local[:, hip] = world[:, _LEG_PARENTS[hip]].swapaxes(-1, -2) @ hip_world
-        local[:, knee] = knee_local
-        local[:, ankle] = (hip_world @ knee_local).swapaxes(-1, -2) @ world[:, ankle]
-    return local
+    if not BEND_LIMITS[0] <= drive <= BEND_LIMITS[1]:
+        raise ValueError(f"Hip knee drive must be within {BEND_LIMITS[0]}-{BEND_LIMITS[1]}")
+    from scipy.optimize import least_squares
 
-
-def absorb_vertical(record, body, bend=1.0, fps=30.0):
-    """Plant the feet and absorb the pelvis height into knee flexion.
-
-    bend=0 returns the input unchanged (the old whole-body bob); bend=1 plants
-    both feet and bows the knees toward the camera. Returns (transl, body_pose).
-    """
-    if not BEND_LIMITS[0] <= bend <= BEND_LIMITS[1]:
-        raise ValueError(f"Hip knee bend must be within {BEND_LIMITS[0]}-{BEND_LIMITS[1]}")
     g = record["smpl_params_global"]
-    transl = g["transl"].numpy().astype(np.float64)
+    incam = record["smpl_params_incam"]
     body_pose = g["body_pose"].numpy().astype(np.float64).reshape(-1, 21, 3)
-    if bend == 0.0:
-        return transl, body_pose.reshape(-1, 63)
-    n = len(transl)
-    rest = _rest_joints(body, g["betas"][0].numpy())
+    if drive == 0.0:
+        return body_pose.reshape(-1, 63)
+    n = len(body_pose)
+    keypoints = keypoints.detach().cpu().numpy() if hasattr(keypoints, "detach") else np.asarray(keypoints)
+    keypoints = np.asarray(keypoints, np.float64)
+    K = K.detach().cpu().numpy() if hasattr(K, "detach") else np.asarray(K)
+    K = np.asarray(K, np.float64)
+    if K.ndim == 2:
+        K = np.broadcast_to(K, (n, 3, 3))
+    fx, fy = K[:, 0, 0], K[:, 1, 1]
+    cx, cy = K[:, 0, 2], K[:, 1, 2]
+    rest = _rest_joints(body, incam["betas"][0].numpy())
     mean = body.pose_mean.numpy().reshape(55, 3)
     abs_aa = np.zeros((n, 22, 3))
-    abs_aa[:, 0] = g["global_orient"].numpy()
-    abs_aa[:, 1:22] = body_pose + mean[1:22]
-    positions, world = _forward_aa(rest, transl, abs_aa)
-    # floor: lowest sole low-passed; foot rises 3.4 cm vs 12.9 cm pelvis, treated planted
-    foot_low = np.minimum(positions[:, 10, 1], positions[:, 11, 1])
-    ground = _gaussian(foot_low[:, None], SOLE_SECONDS * fps)[:, 0]
-    # 根高度回退：follow 可能把骨盆抬到腿伸直都够不到脚底的高度（实测超腿长
-    # 4.8 cm）。按「腿长 + 踝脚底 + 视频脚趾踮脚 3.4 cm」作物理上限，整体下沉根
-    # （所有帧同一常量，不改骨盆抬升 ptp），让脚趾保留约 3.4 cm 的踮脚而非悬空。
-    l1 = np.linalg.norm(rest[4] - rest[1]); l2 = np.linalg.norm(rest[7] - rest[4])
-    ankle_foot = abs(rest[7, 1] - rest[10, 1])
-    max_reach = l1 + l2 + ankle_foot + 0.034  # 0.034 = 视频脚趾踮脚参考
-    pelvis_ground = positions[:, 0, 1] - ground
-    over = float(max(0.0, pelvis_ground.max() - max_reach))
-    if over > 0.0:
-        transl = transl - np.array([0.0, over, 0.0])
-        positions, world = _forward_aa(rest, transl, abs_aa)
-        foot_low = np.minimum(positions[:, 10, 1], positions[:, 11, 1])
-        ground = _gaussian(foot_low[:, None], SOLE_SECONDS * fps)[:, 0]
-    targets = np.empty((n, 2, 3))
-    for foot, (ankle_i, foot_i) in enumerate(((7, 10), (8, 11))):
-        offset = positions[:, ankle_i, 1] - positions[:, foot_i, 1]
-        targets[:, foot] = positions[:, ankle_i].copy()
-        planted = ground + offset
-        targets[:, foot, 1] = positions[:, ankle_i, 1] + bend * (planted - positions[:, ankle_i, 1])
-    camera_axis = _camera_axis(record, fps)
-    local = _plant_legs_toward_camera(rest, positions, world, targets, camera_axis)
+    abs_aa[:, 0] = incam["global_orient"].numpy()
+    abs_aa[:, 1:22] = incam["body_pose"].numpy().reshape(-1, 21, 3) + mean[1:22]
+    positions, joint_world = _forward_aa(rest, incam["transl"].numpy().astype(np.float64), abs_aa)
+    # (hip, knee, ankle, COCO hip, COCO knee, COCO ankle, shin length)
+    legs = (
+        (1, 4, 7, 11, 13, 15, np.linalg.norm(rest[7] - rest[4])),
+        (2, 5, 8, 12, 14, 16, np.linalg.norm(rest[8] - rest[5])),
+    )
+    flex = np.zeros((n, 2))
+    for t in range(n):
+        for li, (hip, knee, ankle, ch, ck, ca, shin_len) in enumerate(legs):
+            H = positions[t, hip]; Kex = positions[t, knee]; A = positions[t, ankle]
+            vector = Kex - H
+            vH = fy[t] * H[1] / H[2] + cy[t]
+            target_v = (keypoints[t, ck, 1] - keypoints[t, ch, 1]) * KNEE_CORR
+
+            def residual(x, vector=vector, H=H, A=A, vH=vH, target_v=target_v, fyt=float(fy[t]), cyt=float(cy[t])):
+                theta = x[0]
+                cos, sin = np.cos(theta), np.sin(theta)
+                rotated = np.array([vector[0], cos * vector[1] - sin * vector[2], sin * vector[1] + cos * vector[2]])
+                knee_v = H + rotated
+                vK = fyt * knee_v[1] / knee_v[2] + cyt
+                return np.array([
+                    (vK - vH - target_v) / REFIT_V_SIGMA,
+                    (np.linalg.norm(A - knee_v) - shin_len) / (REFIT_LEN_SIGMA * shin_len),
+                    theta / REFIT_FLEX_SIGMA,
+                    max(0.0, knee_v[2] - H[2]) / REFIT_FORWARD_SIGMA,
+                ])
+            # Sagittal flexion must not push the knee behind the hip; the upper
+            # bound is the angle that brings the knee level with the hip (or zero
+            # if ExMR already placed it behind, so we never bend it further back).
+            theta_max = max(0.0, float(np.arctan2(-vector[2], vector[1])))
+            solution = least_squares(residual, np.zeros(1), method="trf",
+                                      bounds=([-1.2], [theta_max]))
+            flex[t, li] = solution.x[0] * drive
+    # The per-frame fit follows the keypoint noise frame by frame; low-pass the
+    # flexion along time so the legs do not jitter (see REFIT_SMOOTH_FRAMES).
+    flex = _gaussian(flex, REFIT_SMOOTH_FRAMES)
+    new_knee = np.zeros((n, 2, 3))
+    for t in range(n):
+        for li, (hip, knee, ankle, ch, ck, ca, shin_len) in enumerate(legs):
+            H = positions[t, hip]; Kex = positions[t, knee]
+            vector = Kex - H
+            theta = flex[t, li]
+            cos, sin = np.cos(theta), np.sin(theta)
+            rotated = np.array([vector[0], cos * vector[1] - sin * vector[2], sin * vector[1] + cos * vector[2]])
+            new_knee[t, li] = H + rotated
+    # Inverse-kinematics the UpLeg/Leg rotations; the ankles keep their world rotation.
+    local = joint_world.copy()
+    for j, p in enumerate(_LEG_PARENTS):
+        if p >= 0:
+            local[:, j] = joint_world[:, p].swapaxes(-1, -2) @ joint_world[:, j]
+    for li, (hip, knee, ankle) in enumerate(((1, 4, 7), (2, 5, 8))):
+        upper = rest[knee] - rest[hip]; lower = rest[ankle] - rest[knee]
+        for t in range(n):
+            hip_world = align(joint_world[t, hip] @ upper, new_knee[t, li] - positions[t, hip]) @ joint_world[t, hip]
+            knee_local = align(lower, hip_world.T @ (positions[t, ankle] - new_knee[t, li]))
+            local[t, hip] = joint_world[t, _LEG_PARENTS[hip]].swapaxes(-1, -2) @ hip_world
+            local[t, knee] = knee_local
+            local[t, ankle] = (hip_world @ knee_local).swapaxes(-1, -2) @ joint_world[t, ankle]
     new_abs = Rotation.from_matrix(local.reshape(-1, 3, 3)).as_rotvec().reshape(n, 22, 3)
-    new_body_pose = (new_abs[:, 1:22] - mean[1:22]).reshape(n, 63)
-    return transl, new_body_pose
+    return (new_abs[:, 1:22] - mean[1:22]).reshape(n, 63)
 
 
-def match_video(record, body_path, sway=1.0, bend=1.0, fps=30.0):
-    """(transl, body_pose) whose root follows the video and whose knees absorb
-    the vertical bob. sway scales the horizontal excursion; bend the knee depth.
+def match_video(record, body_path, sway=1.0, bend=1.0, fps=30.0, keypoints=None, K=None):
+    """(transl, body_pose) whose root follows the video and whose legs are refit
+    from the video 2D keypoints. sway scales the horizontal excursion; the vertical
+    excursion is auto-calibrated to the video (6.1); bend is the knee drive (0 keeps
+    ExMR's legs, 1 replaces them with the 2D refit).
     """
     if not GAIN_LIMITS[0] <= sway <= GAIN_LIMITS[1]:
         raise ValueError(f"Hip sway gain must be within {GAIN_LIMITS[0]}-{GAIN_LIMITS[1]}")
@@ -270,11 +310,16 @@ def match_video(record, body_path, sway=1.0, bend=1.0, fps=30.0):
     camera_root = _pelvis(body, camera)
     followed = follow_camera_root(world["transl"], world_root, camera_root,
                                   world["global_orient"], camera["global_orient"], fps)
-    followed = scale_excursion(followed, sway, 1.0)  # 垂直不再缩放，交给 bend
-    # apply the knee absorption on the record that will be saved
+    # 6.1: restore the compressed vertical excursion with the auto-calibrated gain.
+    bob = _bob_gain(camera_root, keypoints, K, fps) if keypoints is not None and K is not None else 1.0
+    followed = scale_excursion(followed, sway, bob)
+    # apply the 2D leg refit on the record that will be saved
     import torch
     record_work = dict(record)
     record_work["smpl_params_global"] = dict(world)
     record_work["smpl_params_global"]["transl"] = torch.from_numpy(followed).to(world["transl"].dtype)
-    transl, body_pose = absorb_vertical(record_work, body, bend, fps)
-    return transl, body_pose
+    if keypoints is None or K is None:
+        body_pose = world["body_pose"].numpy().astype(np.float64)
+    else:
+        body_pose = refit_legs(record_work, body, keypoints, K, fps, bend)
+    return followed, body_pose

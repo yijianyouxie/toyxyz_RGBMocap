@@ -23,7 +23,7 @@ def _bend(value):
     except (TypeError, ValueError):
         raise ValueError('Invalid ExMR settings') from None
     if not BEND_LIMITS[0] <= bend <= BEND_LIMITS[1]:
-        raise ValueError(f'ExMR knee bend must be within {BEND_LIMITS[0]}-{BEND_LIMITS[1]}')
+        raise ValueError(f'ExMR leg refit must be within {BEND_LIMITS[0]}-{BEND_LIMITS[1]}')
     return bend
 
 
