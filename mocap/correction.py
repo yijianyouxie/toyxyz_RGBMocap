@@ -31,8 +31,8 @@ _LEAN_CAP_K = 1.0
 # 34 degrees on the Valentine clip against 6 on the regression clip). Treat the
 # take median as a posture bias, not as motion: one constant angle cannot
 # introduce a temporal artefact, and clamping per frame would flatten real nods.
-_HEAD_PITCH_THRESHOLD = 10.
-_HEAD_PITCH_MAX = 25.
+_HEAD_PITCH_THRESHOLD = 5.
+_HEAD_PITCH_MAX = 35.
 _HEAD_NECK_SHARE = .45
 
 
