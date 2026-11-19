@@ -83,7 +83,7 @@ def run(project,emit=lambda *a,**k:None,result='corrected_initial'):
     import torch
     from .flow_backend import save_tensor,validate_motion
     from .motion_tools import result_is_current
-    from .correction import correct_arrays,prepare_contacts,sole_metrics,contact_strength,backend
+    from .correction import correct_arrays,prepare_contacts,sole_metrics,contact_strength,backend,normalize_head_pitch,straighten_upper_spine
     from .correction_settings import effective_options
     from .scene_floor import binding,receipt_matches
     from .foot_contacts import read_edit,contact_revision
@@ -107,10 +107,26 @@ def run(project,emit=lambda *a,**k:None,result='corrected_initial'):
     # Mark before publishing any payload; interrupted generations cannot export.
     begin_update(project,kind,'correct')
     out_root,out_quat,report=correct_arrays(geometry.rest[:22],roots,quats,probes,probabilities,fps,floor,
-        preset=options['preset'],contact_ranges=ranges,pelvis_offset=options['pelvis_offset'],mode=options['mode'],foot_enabled=options['foot_lock'],balance=False,emit=emit)
+        preset=options['preset'],contact_ranges=ranges,pelvis_offset=options['pelvis_offset'],mode=options['mode'],foot_enabled=options['foot_lock'],balance=options.get('balance',True),emit=emit)
     from .hand_lock import apply as apply_hands
     report['hand_lock']=apply_hands(geometry.rest[:22],roots,quats,out_root,out_quat,geometry.palm_offsets,fps,options['mode'],report['floor'],options['preset'],hand_ranges,options['hand_lock'],emit)
     report['warning']=' '.join(filter(None,(report['warning'],report['hand_lock']['warning'])))
+    # After balance (and hand lock): the head is a COM term, so neutralising it
+    # before the pitch solve would change every balance figure. Only neck/head
+    # rotate, so no contact or sole metric is affected.
+    if options.get('head',True):
+        posture=normalize_head_pitch(out_quat,fps)
+        report.update(posture)
+        if posture.get('head_posture'):
+            report['method']=report['method']+'; take-wide neck/head pitch neutralised about the chest axis'
+        # FlowHMR's thorax leans forward much more than ExMR's, so levelling
+        # the head against the chest alone still leaves the neck bone tipped
+        # in world space. Level the top spine as well; only upper-body joints
+        # move, so every contact and sole metric stays exact.
+        spine=straighten_upper_spine(out_quat,fps)
+        report.update(spine)
+        if spine.get('spine_pitch_correction_deg',0)>1e-3:
+            report['method']=report['method']+'; take-wide upper-spine world pitch levelled'
     after=np.empty_like(probes)
     for first in range(0,n,128):after[first:first+128]=geometry.sample(out_root[first:first+128],out_quat[first:first+128])[0]
     active,anchors,*_=prepare_contacts(probes,probabilities,fps,floor,options['preset'],ranges,options['mode'])
@@ -124,12 +140,27 @@ def run(project,emit=lambda *a,**k:None,result='corrected_initial'):
         report['contact_sole_height_'+label+'_m']=float(np.abs(heights[active]-levels[active]).mean()) if active.any() else 0.
     output=dict(params);output['rot6d']=params['rot6d'].clone();output['trans']=params['trans'].clone()
     matrices=Rotation.from_quat(out_quat[...,[1,2,3,0]].reshape(-1,4)).as_matrix().reshape(n,22,3,3)
-    # Copy source trunk, fingers and predictions. Arms are published only when
-    # enabled hand contacts were solved; their wrist world frames are retained.
+    # Copy source trunk, fingers and predictions. Legs/arms are published only
+    # when their contacts were solved, keeping wrist world frames retained.
+    # Balance pitches the whole body (root, spine and arms) and head posture
+    # rotates neck/head, so those local rotations must be published too or the
+    # option would have no effect on the exported motion.
     if n>1:
-        for joint in ((1,2,4,5,7,8) if report['contacts'] else ()) + ((13,14,16,17,18,19,20,21) if report['hand_lock']['contacts'] else ()):
+        published=set()
+        if report['contacts']:published.update((1,2,4,5,7,8))
+        if report['hand_lock']['contacts']:published.update((13,14,16,17,18,19,20,21))
+        # balance pitches the whole body including the root orientation, which
+        # flow stores in rot6d joint 0 (root_rot6d); publishing only 1..21 would
+        # drop the sagittal tilt. ExMR publishes global_orient for the same reason.
+        if report.get('balance'):published.update(range(0,22))
+        if report.get('head_posture'):published.update((12,15))
+        # Upper-spine levelling changes only spine3's local rotation; its
+        # children move through forward kinematics without changing theirs.
+        if report.get('spine_pitch_correction_deg',0)>1e-3:published.add(9)
+        for joint in sorted(published):
             output['rot6d'][0,:,joint]=torch.from_numpy(matrices[:,joint,:,:2].reshape(n,6).astype(np.float32))
-        if report['contacts']:output['trans'][0]=torch.from_numpy((out_root-geometry.rest[0]).astype(np.float32))
+        if report['contacts'] or report.get('balance'):
+            output['trans'][0]=torch.from_numpy((out_root-geometry.rest[0]).astype(np.float32))
     output['body_rot6d']=output['rot6d'][:,:,1:];output['root_rot6d']=output['rot6d'][:,:,0]
     # Derived upstream diagnostic fields are not valid after contact IK.
     for key in ('local_joints_positions','smooth_root_pos','pelvis_world'):output.pop(key,None)

@@ -12,7 +12,7 @@ def finger_mapping():
     return np.array([*range(22),*[j+side for side in (0,15) for first in (34,22,25,31,28) for j in range(first,first+3)]])
 
 
-def target_rig(rest,vertices=None,skin=None):
+def target_rig(rest,vertices=None,skin=None,straight_spine=False,straight_neck=False):
     from .mixamo_rig import skeleton
     # skeleton() accepts SMPL-X anatomy ordering. Only this small joint view is
     # reordered; no surface/model conversion or approximate body fitting occurs.
@@ -38,7 +38,7 @@ def target_rig(rest,vertices=None,skin=None):
         top=head[head[:,1].argmax()]
         rig['ends'][15]=top-rest[15]
     from .source_animation import source_rig
-    return source_rig(rig,rest),mapping
+    return source_rig(rig,rest,straight_spine=straight_spine,straight_neck=straight_neck),mapping
 
 
 def validate_axes(local,rig=None):
@@ -83,6 +83,8 @@ def prepare(project,emit=lambda *a,**k:None,kind='initial'):
     if kind not in ('initial','corrected_initial'):raise ValueError('Unsupported FlowHMR preview result')
     if not result_is_current(project,kind):raise ValueError('FlowHMR inference is incomplete or outdated. Run Reconstruct 3D before preparing its preview.')
     state=json.loads((project/'project.json').read_text(encoding='utf-8'));n=state['frames'];fps=float(state['fps'])
+    from .correction_settings import correction_options
+    straight_spine=correction_options(state.get('correction',{})).get('spine',True)
     filename=RESULTS[kind][0]
     params=load_tensor(project/filename);validate_motion(params,n)
     model=BY_KEY['smplh'].path;model_stamp=file_stat(model)
@@ -95,9 +97,18 @@ def prepare(project,emit=lambda *a,**k:None,kind='initial'):
     with torch.no_grad():
         rest=body(neutral)['keypoints3d'][0].numpy()
         template=mesh(neutral)['vertices'][0].numpy()
-    rig,mapping=target_rig(rest,template,mesh.lbs_weights.numpy());binding=bind_pose(rig)
+    rig,mapping=target_rig(rest,template,mesh.lbs_weights.numpy(),straight_spine,True);binding=bind_pose(rig)
+    # The bind (rig rest, per-frame goals and FBX bind) must share one rest.
+    # source_rig straightens the rig rest internally; mirror it on the rest
+    # passed to the FBX bind and used to rebuild per-frame goals below.
+    # FlowHMR's SMPL-H neck bind bone is short and forward-tilted; stand it
+    # upright to match the ExMR/SMPL-X neck and keep the overlay bone vertical.
+    from .source_animation import straighten_spine,straighten_neck_bind
+    neutral_rest=rest.copy()
+    if straight_spine:straighten_spine(neutral_rest)
+    straighten_neck_bind(neutral_rest)
     from .fbx_bind import prepare as prepare_fbx_bind
-    fbx_binding=prepare_fbx_bind(rig,rest,template,'smplh',fps)
+    fbx_binding=prepare_fbx_bind(rig,neutral_rest,template,'smplh',fps)
     dummy=mannequin(rig)
     token=uuid.uuid4().hex[:12];stem=f'{kind}_flow-{token}'
     files=dict(frames_file=stem+'-rig.npy',joints_file=stem+'-rig-joints.npy',reference_joints_file=stem+'-reference.npy',
@@ -131,7 +142,15 @@ def prepare(project,emit=lambda *a,**k:None,kind='initial'):
                 world_native=local_native.copy()
                 for j,p in enumerate(body.parents.tolist()):
                     if p>=0:world_native[:,j]=world_native[:,p]@world_native[:,j]
-                local,posed,world=fit(rig,joints[:,0],world_native[:,:22],joints[:,:22],
+                # Rebuild goals from the bind rest used by the rig and FBX bind
+                # (spine and neck straightened) with the source world rotations,
+                # otherwise the fixed-length fit cannot reach the changed goals.
+                goals=np.empty_like(joints[:,:22])
+                goals[:,0]=joints[:,0]
+                for j,p in enumerate(body.parents.tolist()[:22]):
+                    if p>=0:
+                        goals[:,j]=goals[:,p]+np.einsum('tij,j->ti',world_native[:,p],neutral_rest[j]-neutral_rest[p])
+                local,posed,world=fit(rig,joints[:,0],world_native[:,:22],goals,
                     surface_endpoints=surface_endpoints[begin:stop],fps=fps)
                 # Native hand animation is transferred in global rotation space;
                 # each outgoing phalanx retains its own source orientation.
@@ -140,10 +159,10 @@ def prepare(project,emit=lambda *a,**k:None,kind='initial'):
                     world[:,j]=world_native[:,mapping[j]]
                     local[:,j]=world[:,p].swapaxes(-1,-2)@world[:,j]
                 posed,world=fk(rig,joints[:,0],local)
-                core=slice(first-begin,end-begin);local=local[core];world=world[core];posed=posed[core];joints=joints[core]
+                core=slice(first-begin,end-begin);local=local[core];world=world[core];posed=posed[core];joints=joints[core];goals=goals[core]
                 native_rotations[first:end]=world_native[core,:22]
                 native_points[first:end]=joints[:,:22];reference[first:end]=joints[:,:22]
-                errors.append(np.linalg.norm(posed[:,:22]-joints[:,:22],axis=-1))
+                errors.append(np.linalg.norm(posed[:,:22]-goals,axis=-1))
                 finger_errors.append(np.linalg.norm(posed[:,22:]-joints[:,mapping[22:]],axis=-1))
                 for j in (7,8,20,21):distal_error=max(distal_error,float(np.abs(world[:,j]-world_native[core,j]).max()))
                 hinge_error=max(hinge_error,validate(local))
@@ -180,7 +199,7 @@ def prepare(project,emit=lambda *a,**k:None,kind='initial'):
             correction=json.loads((project/(kind+'_correction.json')).read_text(encoding='utf-8'))
             for suffix in ('correction.json','contacts.npz'):sources[kind+'_'+suffix]=file_stat(project/(kind+'_'+suffix))
         if file_stat(model)!=model_stamp or file_stat(project/filename)!=source_stamp or not result_is_current(project,kind):raise ValueError('FlowHMR source changed while exporting; retry.')
-        atomic_json(project/(kind+'_mixamo.json'),dict(version=VERSION,kind=kind,frames=n,fps=fps,names=rig['names'],sources=sources,**files,
+        atomic_json(project/(kind+'_mixamo.json'),dict(version=VERSION,kind=kind,frames=n,fps=fps,names=rig['names'],spine_straight=bool(straight_spine),sources=sources,**files,
             raw_vertex_count=6890,representation='smplh',source_model='flowhmr',model_key='smplh',model_path=str(model),model_stat=model_stamp,code=code,
             code_stats={name:file_stat(ROOT/'mocap'/name) for name in code},selected_source_fit=fit_summary,source_fit=fit_summary,
             finger_fit_max_m=float(finger_error.max()),finger_fit_mean_m=float(finger_error.mean()),hinge_axis_max_error=hinge_error,

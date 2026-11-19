@@ -173,6 +173,58 @@ def normalize_head_pitch(quat,fps=30.):
     return report
 
 
+def straighten_upper_spine(quat,fps=30.):
+    """Level the neck/head in WORLD space by rotating the top spine joint.
+
+    normalize_head_pitch levels the head against the chest, but a frontal
+    monocular fit can also pitch the whole thorax forward. When the chest
+    leans, the neck bone still looks tipped even though the head is level
+    relative to it. FlowHMR's thorax measured +6.7 deg against ExMR's -3 deg,
+    so the same head correction left its neck ~9 deg forward while ExMR's was
+    ~5. This adds one take-wide constant rotation to spine3 so the neck and
+    head end up upright in world space. Only the upper spine (and the arms
+    hanging off it) move; hips, legs and every contact stay exact. The angle
+    comes from the take median, so real per-frame nods are preserved.
+    """
+    empty=dict(spine_pitch_correction_deg=0.,neck_world_pitch_before_deg=0.,
+               neck_world_pitch_after_deg=0.)
+    n=len(quat)
+    if n<max(2,int(round(fps))):return empty
+    local=Rotation.from_quat(np.asarray(quat)[...,[1,2,3,0]].reshape(-1,4)).as_matrix().reshape(n,22,3,3)
+    def world(lo):
+        w=lo.copy()
+        for j in range(1,22):w[:,j]=w[:,PARENTS[j]]@lo[:,j]
+        return w
+    def neck_pitch(w):
+        # Signed forward pitch of the neck's up-axis against world vertical,
+        # measured in the root's horizontal sagittal direction.
+        fwd=w[:,0,:,2]
+        fwd=fwd-np.outer(fwd[:,1],np.array([0.,1.,0.]))
+        norm=np.linalg.norm(fwd,axis=1,keepdims=True);norm[norm<1e-6]=1.
+        fwd=fwd/norm
+        up=w[:,12,:,1]
+        return np.degrees(np.arctan2(np.sum(up*fwd,axis=1),np.sum(up*np.array([0.,1.,0.]),axis=1)))
+    rot=world(local)
+    before=neck_pitch(rot)
+    extra=float(np.clip(np.median(before)-_HEAD_PITCH_THRESHOLD,0.,_HEAD_PITCH_MAX))
+    report=dict(empty,neck_world_pitch_before_deg=float(np.median(before)),
+                neck_world_pitch_after_deg=float(np.median(before)))
+    if extra<=1e-3:return report
+    up=rot[:,9,:,1];fwd=rot[:,9,:,2]
+    axis=np.cross(up,fwd);axis/=np.maximum(np.linalg.norm(axis,axis=1,keepdims=True),1e-9)
+    # Express the world lateral axis in spine3's parent frame, then rotate the
+    # LOCAL joint so forward kinematics carries it to neck, head and arms.
+    parent=rot[:,PARENTS[9]]
+    local_axis=np.einsum('tji,ti->tj',parent,axis)
+    R=Rotation.from_rotvec(local_axis*np.radians(-extra)).as_matrix()
+    local[:,9]=np.einsum('tij,tjk->tik',R,local[:,9])
+    quat[...,[1,2,3,0]]=Rotation.from_matrix(local.reshape(-1,3,3)).as_quat().reshape(n,22,4)
+    after=neck_pitch(world(local))
+    report.update(spine_pitch_correction_deg=extra,
+                  neck_world_pitch_after_deg=float(np.median(after)))
+    return report
+
+
 def balance_pose(rest,root,quat,probes,active,floor,fps,max_pitch=12.,deadband=.02,iterations=3,max_total=10.,reach_allow=.03):
     """Rotate the sagittal pose toward the centre of the foot support.
 

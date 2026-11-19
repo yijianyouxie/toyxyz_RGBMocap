@@ -48,7 +48,25 @@ def straighten_spine(rest):
         rest[joint] = target
 
 
-def source_rig(original, source_rest, straight_spine=False):
+def straighten_neck_bind(rest):
+    """Place the head joint vertically above the neck in the export bind.
+
+    SMPL-H puts the head only ~7 cm above the neck and ~5 cm forward, so the
+    exported neck bone is short and points ~37 degrees forward. SMPL-X (ExMR)
+    has a ~16 cm upright neck. The rest skeleton is shared by the overlay and
+    the BVH/FBX bind, so the tilted bone shows in every frame regardless of the
+    motion correction. Put the head directly above the neck while keeping the
+    segment length; lateral offset is preserved, the forward offset removed.
+    """
+    neck, head = 12, 15
+    delta = rest[head] - rest[neck]
+    length = float(np.linalg.norm(delta))
+    if length <= 1e-6:
+        return
+    rest[head] = rest[neck] + np.array([delta[0], length, 0.])
+
+
+def source_rig(original, source_rest, straight_spine=False, straight_neck=False):
     """Keep registered torso/pivots and fingers; straighten rest limbs."""
     rig = {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in original.items()}
     old = rig['rest'].copy()
@@ -57,6 +75,8 @@ def source_rig(original, source_rest, straight_spine=False):
     rest[:22] = source_rest[:22] - source_rest[0]
     if straight_spine:
         straighten_spine(rest)
+    if straight_neck:
+        straighten_neck_bind(rest)
     for hand, ids in ((20, range(22, 37)), (21, range(37, 52))):
         rest[list(ids)] += rest[hand] - old[hand]
     source = rest.copy()
