@@ -16,10 +16,10 @@ POLICY_ONLY = {
     "a2fb18686236d6852df13f03b95890860e961b63072d809eeaf5cd3331edd6bc": "3125b5a360d71c229a958a553548af0f03c82b58698f1b758a14f2048a2f7e92",
     "3d166c1b0807397328f82f973b7617118b3c35d6435f4f85036bd8be2925268a": "d0d32032fad3470cc4801134d4bf4fafdf8bfc5bc805228ece5cc8dabe4f370e",
     "86e0f23ca7a6d06bf177436bf8d2a8462577a8f151d3bdc7380c63dcdef016a3": "8e5e7e5e2c6f677299d4a6081f20c5e7c2fb0fe17f18c0e0a4e5599bb01f8b1a",
-    # exmr_backend: adds the opt-in hip switch (hip_motion, default off) and its 2D leg refit.
-    # Off reproduces the previous output; on already has its own options block in the signature,
-    # so this alias only keeps existing projects from recomputing once after the update.
-    "a84c96aa06cb65ed3ad849d867b518e06f648cad0dc71481c95f88dff5bdcaf3": "77c7162093f5bbf9b4dba46287f6542d5069cd3aef24444f531eac94335bd82f"
+    # exmr_backend: adds the opt-in hip switch (hip_motion, default off). Off reproduces the
+    # previous output; on already has its own options block in the signature, so this alias only
+    # keeps existing projects from recomputing once after the update.
+    "b7acd2876031db9e730c3b86279a21ea18c7c96881f2307c13a3a15f9037179c": "77c7162093f5bbf9b4dba46287f6542d5069cd3aef24444f531eac94335bd82f"
 }
 
 
