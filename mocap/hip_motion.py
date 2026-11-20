@@ -47,16 +47,23 @@ BEND_LIMITS = (0.0, 1.0)
 # ~7.8% longer (a constant offset, not motion-coupled). Shorten the video knee
 # along the hip->knee direction before the 2D fit.
 KNEE_CORR = 1.0 / 1.078
-# Residual scales for refit_legs (the sagittal knee refit).
+# Residual scales for refit_legs (the sagittal knee + shin refit).
 REFIT_V_SIGMA = 8.0      # thigh projection v alignment (px)
 REFIT_LEN_SIGMA = 0.06   # soft shin-length prior (relative)
 REFIT_FLEX_SIGMA = 1.0   # flexion-angle prior (rad)
 # The sagittal flexion must not push the knee behind the hip (a backward bend);
 # a positive z excess is penalised hard, so the knee stays forward of the hip.
 REFIT_FORWARD_SIGMA = 0.05
-# 2D keypoint noise makes the per-frame flexion jitter; low-pass the fitted
-# angles along time. This is frames of Gaussian sigma, so the ~1.5 s squat rhythm survives.
-REFIT_SMOOTH_FRAMES = 2.0
+# The ankle is pulled to the video ankle's absolute image height (the depth stays
+# from ExMR, so only the vertical is corrected). This is what keeps the feet
+# planted while the pelvis rises, so the squat-then-straighten reads as a hip pop
+# instead of the whole body translating up. In metres: 0.02 = 2 cm of slack.
+ANKLE_ABS_SIGMA = 0.02
+# 2D keypoint noise makes the per-frame flexion jitter; the shin fit is noisier
+# still because the absolute ankle target couples the monocular depth estimate.
+# Low-pass both angles along time. This is frames of Gaussian sigma, so the
+# ~1.5 s squat rhythm survives.
+REFIT_SMOOTH_FRAMES = 4.0
 # SMPL-X 22-joint parent list, copied from correction.PARENTS to avoid importing
 # correction (which pulls the KimodoMotionCorrection .pyd chain into the exmr worker).
 _LEG_PARENTS = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19]
@@ -201,13 +208,16 @@ def refit_legs(record, body, keypoints, K, fps=30.0, drive=1.0):
     knees with a sagittal flexion that follows the 2D.
 
     ExMR keeps the legs nearly straight vertically and explains the hip bob as a
-    knee bend toward the camera. The 2D knee keypoints still carry the real
-    squat-then-straighten rhythm, so each leg is refit per frame by rotating the
-    knee about the body's left-right axis: the thigh projection follows the video
-    (corrected for the COCO-knee/SMPL-knee definition offset) under a soft shin-
-    length and flexion prior. The ankle stays put, so the feet keep their spacing.
+    knee bend toward the camera. The 2D knee and ankle keypoints still carry the
+    real squat-then-straighten rhythm, so each leg is refit per frame by two
+    sagittal rotations: the thigh follows the video knee projection (corrected
+    for the COCO-knee/SMPL-knee definition offset) and the shin is pulled so the
+    ankle reaches the video ankle's absolute image height at the ExMR ankle
+    depth. The ankle term keeps the feet planted while the pelvis rises, so the
+    squat reads as a hip pop instead of the whole body translating up. A soft
+    shin-length and forward constraint keep each rotation plausible.
 
-    drive blends the fitted knees toward ExMR: 0 returns the input body_pose, 1
+    drive blends the fitted legs toward ExMR: 0 returns the input body_pose, 1
     replaces the UpLeg/Leg rotations entirely. Returns body_pose (n, 63).
     """
     if not BEND_LIMITS[0] <= drive <= BEND_LIMITS[1]:
@@ -239,46 +249,79 @@ def refit_legs(record, body, keypoints, K, fps=30.0, drive=1.0):
         (1, 4, 7, 11, 13, 15, np.linalg.norm(rest[7] - rest[4])),
         (2, 5, 8, 12, 14, 16, np.linalg.norm(rest[8] - rest[5])),
     )
+    # Per frame and per leg, two sagittal rotations are fit: theta on the thigh
+    # (knee about the body's left-right axis) and phi on the shin (ankle about
+    # the same axis). The knee projection follows the video (corrected for the
+    # COCO-knee/SMPL-knee definition offset), and the ankle is pulled to the
+    # video ankle's absolute image height at the ExMR ankle depth. Without the
+    # absolute ankle term the feet translate up with the pelvis and the hip pop
+    # reads as the whole body lifting; with it the feet stay near the floor and
+    # the squat-then-straighten shows in the pelvis-to-foot distance. A soft
+    # shin-length prior and a forward-constraint keep each rotation plausible.
     flex = np.zeros((n, 2))
+    shin = np.zeros((n, 2))
     for t in range(n):
         for li, (hip, knee, ankle, ch, ck, ca, shin_len) in enumerate(legs):
-            H = positions[t, hip]; Kex = positions[t, knee]; A = positions[t, ankle]
-            vector = Kex - H
+            H = positions[t, hip]; Kex = positions[t, knee]; Aex = positions[t, ankle]
+            thigh_vec = Kex - H
+            shin_vec = Aex - Kex
             vH = fy[t] * H[1] / H[2] + cy[t]
-            target_v = (keypoints[t, ck, 1] - keypoints[t, ch, 1]) * KNEE_CORR
+            target_knee_v = (keypoints[t, ck, 1] - keypoints[t, ch, 1]) * KNEE_CORR
+            # Absolute ankle target: the video ankle v back-projected to the
+            # ExMR ankle depth, so the vertical is corrected while the depth
+            # (the least reliable monocular axis) is left to the fit.
+            target_ankle_y = (keypoints[t, ca, 1] - cy[t]) * Aex[2] / fy[t]
+            fyt = float(fy[t]); cyt = float(cy[t])
 
-            def residual(x, vector=vector, H=H, A=A, vH=vH, target_v=target_v, fyt=float(fy[t]), cyt=float(cy[t])):
-                theta = x[0]
-                cos, sin = np.cos(theta), np.sin(theta)
-                rotated = np.array([vector[0], cos * vector[1] - sin * vector[2], sin * vector[1] + cos * vector[2]])
-                knee_v = H + rotated
-                vK = fyt * knee_v[1] / knee_v[2] + cyt
+            def residual(x, thigh_vec=thigh_vec, shin_vec=shin_vec, H=H, vH=vH,
+                         target_knee_v=target_knee_v, target_ankle_y=target_ankle_y,
+                         shin_len=shin_len, fyt=fyt, cyt=cyt):
+                theta, phi = x[0], x[1]
+                ct, st = np.cos(theta), np.sin(theta)
+                cp, sp = np.cos(phi), np.sin(phi)
+                rotated_thigh = np.array([thigh_vec[0], ct * thigh_vec[1] - st * thigh_vec[2], st * thigh_vec[1] + ct * thigh_vec[2]])
+                new_knee = H + rotated_thigh
+                vK = fyt * new_knee[1] / new_knee[2] + cyt
+                rotated_shin = np.array([shin_vec[0], cp * shin_vec[1] - sp * shin_vec[2], sp * shin_vec[1] + cp * shin_vec[2]])
+                new_ankle = new_knee + rotated_shin
+                shin_actual = np.linalg.norm(new_ankle - new_knee)
                 return np.array([
-                    (vK - vH - target_v) / REFIT_V_SIGMA,
-                    (np.linalg.norm(A - knee_v) - shin_len) / (REFIT_LEN_SIGMA * shin_len),
+                    (vK - vH - target_knee_v) / REFIT_V_SIGMA,
+                    (new_ankle[1] - target_ankle_y) / ANKLE_ABS_SIGMA,
+                    (shin_actual - shin_len) / (REFIT_LEN_SIGMA * shin_len),
                     theta / REFIT_FLEX_SIGMA,
-                    max(0.0, knee_v[2] - H[2]) / REFIT_FORWARD_SIGMA,
+                    phi / REFIT_FLEX_SIGMA,
+                    max(0.0, new_knee[2] - H[2]) / REFIT_FORWARD_SIGMA,
+                    max(0.0, new_ankle[2] - new_knee[2]) / REFIT_FORWARD_SIGMA,
                 ])
-            # Sagittal flexion must not push the knee behind the hip; the upper
-            # bound is the angle that brings the knee level with the hip (or zero
-            # if ExMR already placed it behind, so we never bend it further back).
-            theta_max = max(0.0, float(np.arctan2(-vector[2], vector[1])))
-            solution = least_squares(residual, np.zeros(1), method="trf",
-                                      bounds=([-1.2], [theta_max]))
+            # The sagittal flexion must not push the knee (or ankle) behind its
+            # parent; the upper bound is the angle that brings it level.
+            theta_max = max(0.0, float(np.arctan2(-thigh_vec[2], thigh_vec[1])))
+            phi_max = max(0.0, float(np.arctan2(-shin_vec[2], shin_vec[1])))
+            solution = least_squares(residual, np.zeros(2), method="trf",
+                                      bounds=([-1.2, -1.2], [theta_max, phi_max]))
             flex[t, li] = solution.x[0] * drive
-    # The per-frame fit follows the keypoint noise frame by frame; low-pass the
-    # flexion along time so the legs do not jitter (see REFIT_SMOOTH_FRAMES).
+            shin[t, li] = solution.x[1] * drive
+    # The per-frame fit follows the keypoint noise frame by frame; low-pass both
+    # angles along time so the legs do not jitter (see REFIT_SMOOTH_FRAMES).
     flex = _gaussian(flex, REFIT_SMOOTH_FRAMES)
+    shin = _gaussian(shin, REFIT_SMOOTH_FRAMES)
     new_knee = np.zeros((n, 2, 3))
+    new_ankle = np.zeros((n, 2, 3))
     for t in range(n):
         for li, (hip, knee, ankle, ch, ck, ca, shin_len) in enumerate(legs):
-            H = positions[t, hip]; Kex = positions[t, knee]
-            vector = Kex - H
-            theta = flex[t, li]
-            cos, sin = np.cos(theta), np.sin(theta)
-            rotated = np.array([vector[0], cos * vector[1] - sin * vector[2], sin * vector[1] + cos * vector[2]])
-            new_knee[t, li] = H + rotated
-    # Inverse-kinematics the UpLeg/Leg rotations; the ankles keep their world rotation.
+            H = positions[t, hip]; Kex = positions[t, knee]; Aex = positions[t, ankle]
+            thigh_vec = Kex - H
+            shin_vec = Aex - Kex
+            theta = flex[t, li]; phi = shin[t, li]
+            ct, st = np.cos(theta), np.sin(theta)
+            cp, sp = np.cos(phi), np.sin(phi)
+            rotated_thigh = np.array([thigh_vec[0], ct * thigh_vec[1] - st * thigh_vec[2], st * thigh_vec[1] + ct * thigh_vec[2]])
+            rotated_shin = np.array([shin_vec[0], cp * shin_vec[1] - sp * shin_vec[2], sp * shin_vec[1] + cp * shin_vec[2]])
+            new_knee[t, li] = H + rotated_thigh
+            new_ankle[t, li] = new_knee[t, li] + rotated_shin
+    # Inverse-kinematics the UpLeg/Leg rotations to the fitted knee and ankle.
+    # The ankle world rotation is kept, so the feet keep their spacing.
     local = joint_world.copy()
     for j, p in enumerate(_LEG_PARENTS):
         if p >= 0:
@@ -287,7 +330,7 @@ def refit_legs(record, body, keypoints, K, fps=30.0, drive=1.0):
         upper = rest[knee] - rest[hip]; lower = rest[ankle] - rest[knee]
         for t in range(n):
             hip_world = align(joint_world[t, hip] @ upper, new_knee[t, li] - positions[t, hip]) @ joint_world[t, hip]
-            knee_local = align(lower, hip_world.T @ (positions[t, ankle] - new_knee[t, li]))
+            knee_local = align(lower, hip_world.T @ (new_ankle[t, li] - new_knee[t, li]))
             local[t, hip] = joint_world[t, _LEG_PARENTS[hip]].swapaxes(-1, -2) @ hip_world
             local[t, knee] = knee_local
             local[t, ankle] = (hip_world @ knee_local).swapaxes(-1, -2) @ joint_world[t, ankle]
