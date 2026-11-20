@@ -134,16 +134,10 @@ def identity(project,stage):
            'exmr_features':['input.mp4','tracking.npz','exmr_keypoints.pt'],
            'exmr':['tracking.npz','exmr_keypoints.pt','exmr_body_features.pt','exmr_hand_features.pt']}[stage]
     root=scene_root(project);root_state=json.loads((root/'project.json').read_text(encoding='utf-8'))
-    config=saved(root,root_state) if stage=='exmr' else None
-    # The hip switch is one option block: off keeps the signature of earlier versions, so taking
-    # it leaves existing results valid instead of recomputing every project after an update.
-    options={'static_camera':config['static_camera'],'smoothing':config['smoothing']} if config else {'pose':'Sapiens2-1B 448x336'}
-    if config and config['hip_motion']:
-        options.update(hip_motion=True,hip_sway_gain=config['hip_sway_gain'],hip_bob_gain=config['hip_bob_gain'])
     return dict(version=VERSION,stage=stage,inputs={name:file_stat(project/name) for name in files},
         memory_policy={name:sha256(ROOT/'mocap'/name) for name in ('memory_mode.py','gpu_offload.py','model_session.py','batch_prefetch.py')},
         root_input=file_stat(root/'input.mp4'),take=state.get('person_frames'),frames=state['frames'],fps=state['fps'],
-        options=options,
+        options=saved(root,root_state) if stage=='exmr' else {'pose':'Sapiens2-1B 448x336'},
         models={key:file_stat(BY_KEY[key].path) for key in STAGE_REQUIREMENTS[stage]},
         image_readers={name:sha256(UPSTREAM/'ExMR/exmr/preprocessing'/name) for name in {
             'exmr_preprocess':('image_io.py','keypoints/sapiens2.py'),
@@ -153,10 +147,8 @@ def identity(project,stage):
         feature_decoder={name:sha256(UPSTREAM/'ExMR/third_party/sam-3d-body/sam_3d_body/models'/name)
             for name in ('decoders/promptable_decoder.py','meta_arch/sam3d_body.py')} if stage=='exmr_features' else {},
         upstream_api=sha256(UPSTREAM/'ExMR/exmr/pipeline.py'),
-        motion_solver={**{name:sha256(UPSTREAM/'ExMR/exmr'/name) for name in
-            ('model/exmr.py','model/global_traj.py','model/ik.py','geometry/camera.py')},
-            **({'mocap/hip_motion.py':sha256(Path(__file__).with_name('hip_motion.py'))}
-               if config and config['hip_motion'] else {})} if stage=='exmr' else {},
+        motion_solver={name:sha256(UPSTREAM/'ExMR/exmr'/name) for name in
+            ('model/exmr.py','model/global_traj.py','model/ik.py','geometry/camera.py')} if stage=='exmr' else {},
         code=code_hash(Path(__file__)),upstream=sha256(UPSTREAM/'ExMR/RGB_MOCAP_PROVENANCE.json'))
 
 
@@ -326,17 +318,6 @@ def run_stage(project,stage,result,emit,force=False,feature_phase=None):
         record={'smpl_params_global':canonical_params(native['smplx_global'],body),
                 'smpl_params_incam':canonical_params(native['smplx_incam'],body),
                 'net_outputs':{'static_conf_logits':native['static_conf_logits'][None]},'source_model':'exmr'}
-        if config['hip_motion']:
-            # The world root is integrated from a predicted velocity and only partly re-anchored;
-            # make it follow the camera-frame root the frames were fitted to, then scale it.
-            # Every later stage reads this translation, so the BVH, the npz and the preview agree.
-            from .hip_motion import match_video
-            emit('progress',current=0,total=0,message='ExMR: match the video hip amplitude')
-            corrected, body_pose = match_video(record, BY_KEY['smplx'].path,
-                float(config['hip_sway_gain']), float(config['hip_bob_gain']), state['fps'])
-            translation = record['smpl_params_global']['transl']
-            record['smpl_params_global']['transl'] = torch.from_numpy(corrected).to(translation.dtype)
-            record['smpl_params_global']['body_pose'] = torch.from_numpy(body_pose).to(translation.dtype)
         save_tensor(native,project/'exmr_results.pt')
         save_tensor(record,project/'hmr4d_results.pt')
         atomic_json(project/'initial_sources.json',{name:file_stat(project/name) for name in ('exmr_results.pt','exmr_keypoints.pt','exmr_body_features.pt','exmr_hand_features.pt','tracking.npz','exmr_camera_sources.json')})
