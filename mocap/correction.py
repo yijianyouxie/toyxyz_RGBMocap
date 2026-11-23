@@ -382,12 +382,8 @@ def correct_foot_roll(quat, rest, roots, fps=30.):
             continue
         up_perp_u = np.where(valid[:, None], up_perp / np.maximum(up_perp_n[:, None], 1e-9), up_perp)
         ref_perp_u = np.where(valid[:, None], ref_perp / np.maximum(ref_perp_n[:, None], 1e-9), ref_perp)
-        # Signed angle from ref_perp to up_perp around the foot-forward axis.
-        # Cross product along fwd_u gives the signed component.
-        cross_fwd = np.einsum('ti,tij->tj',
-                              np.cross(ref_perp_u, up_perp_u),
-                              fwd_u[:, :, None] * np.ones((1, 1, 3)))
-        # Simpler: scalar projection of cross onto fwd_u.
+        # Signed angle from ref_perp to up_perp around the foot-forward axis,
+        # taken as the scalar projection of the cross product onto fwd_u.
         cross_vec = np.cross(ref_perp_u, up_perp_u)  # (n, 3)
         sign = np.einsum('ti,ti->t', cross_vec, fwd_u)  # positive = CCW around fwd
         dot_ang = np.einsum('ti,ti->t', up_perp_u, ref_perp_u)
