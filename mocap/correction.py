@@ -41,7 +41,7 @@ _HEAD_NECK_SHARE = .45
 # as a posture bias and neutralise it with one constant world-Y rotation per
 # ankle. Per-frame foot articulation and contact-locked ankle positions stay exact.
 _FOOT_YAW_THRESHOLD = 5.   # degrees; below this the bias is within normal stance
-_FOOT_YAW_MAX = 10.        # degrees; cap to avoid overcorrection
+_FOOT_YAW_MAX = 6.        # degrees; cap to avoid overcorrection
 # Ankle roll: a frontal monocular fit also cannot constrain foot rotation about
 # the sagittal (foot-forward) axis. A small inward roll (内扣/pronation) barely
 # changes the silhouette, so ExMR can settle with the medial arch collapsed and
