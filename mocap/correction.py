@@ -1249,7 +1249,7 @@ def run(project,emit,result):
                 # Foot yaw: monocular frontal fits cannot constrain foot rotation
                 # around the vertical axis. Apply after head correction so the
                 # ankle positions written to pose are already contact-corrected.
-                if options.get('foot_yaw',True):
+                if options.get('foot_yaw',False):
                     yaw=correct_foot_yaw(out_quats,geometry.rest[:22],out_roots,fps)
                     report.update(yaw)
                     if yaw.get('foot_yaw_correction'):
@@ -1258,7 +1258,7 @@ def run(project,emit,result):
                 # inward tilt of the ankle about the foot's forward axis. Apply
                 # after yaw correction so the roll is measured on the yaw-corrected
                 # foot direction.
-                if options.get('foot_yaw',True):
+                if options.get('foot_roll',False):
                     roll=correct_foot_roll(out_quats,geometry.rest[:22],out_roots,fps)
                     report.update(roll)
                     if roll.get('foot_roll_correction'):

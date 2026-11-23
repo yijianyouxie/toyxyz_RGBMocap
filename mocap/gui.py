@@ -1033,6 +1033,7 @@ class MainWindow(PearWorkspace,PromptHMRWorkspace,MammaWorkspace,CharacterWorksp
                                  '--balance',str(int(self.balance.isChecked())),
                                  '--spine',str(int(self.spine.isChecked())),
                                  '--head',str(int(self.head.isChecked())),
+                                 '--foot-yaw',str(int(self.foot_yaw.isChecked())),
                                  '--pelvis-offset',str(self.pelvis_offset.value())]
         self.start_jobs([("prepare", prepare_args)]
                         + [(stage, ["--result", result] if stage in {"export", "flow_export", "footmr", "handflow", "correct"} and result else None) for stage in stages])
@@ -1100,7 +1101,8 @@ class MainWindow(PearWorkspace,PromptHMRWorkspace,MammaWorkspace,CharacterWorksp
                                    'mode':self.correction_mode.currentData(),'foot_lock':self.foot_lock.isChecked(),'hand_lock':self.hand_lock.isChecked(),
                                    'preset':self.correction_preset.currentData(),'pelvis_offset':self.pelvis_offset.value(),
                                    'balance':self.balance.isChecked(),'spine':self.spine.isChecked(),
-                                   'head':self.head.isChecked()})
+                                   'head':self.head.isChecked(),'foot_yaw':self.foot_yaw.isChecked(),
+                                   'foot_roll':self.foot_yaw.isChecked()})
 
     def update_correction_description(self):
         descriptions = {
