@@ -370,8 +370,6 @@ def correct_foot_roll(quat, rest, roots, fps=30.):
         up_perp_n = np.linalg.norm(up_perp, axis=1)
         # World vertical projected onto the same coronal plane.
         world_up = np.array([0., 1., 0.])
-        dot_wu = np.dot(world_up, fwd_u.T)  # (n,)  broadcast
-        # dot_wu shape: fwd_u is (n,3), so einsum is cleaner:
         dot_wu = np.einsum('i,ti->t', world_up, fwd_u)
         ref_perp = world_up[None, :] - dot_wu[:, None] * fwd_u  # (n, 3)
         ref_perp_n = np.linalg.norm(ref_perp, axis=1)
