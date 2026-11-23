@@ -350,10 +350,18 @@ def correct_foot_roll(quat, rest, roots, fps=30.):
     rest_a = np.asarray(rest, dtype=float)
     roots_a = np.asarray(roots, dtype=float)
     pos, world = fk(rest_a, roots_a, np.asarray(quat))
-    # Sign convention: positive = inward roll (内扣) for both feet.
-    # Left foot inward = ankle up-axis tilts toward +X (right/medial).
-    # Right foot inward = ankle up-axis tilts toward -X (left/medial);
-    # negate to unify convention.
+    # Measurement: the ankle's up-axis (column 1 of its world rotation) tilts
+    # laterally when the ankle rolls (内扣/pronation). The lateral tilt is the
+    # X component of the up-axis. SMPL-X places LEFT at +X and RIGHT at -X in
+    # the rest skeleton, so each foot's medial direction points toward the
+    # body centre: LEFT medial = -X, RIGHT medial = +X.
+    #   Left  inward roll (内扣) = up-axis tilts toward -X  ->  atan2(up_x, up_y) < 0
+    #   Right inward roll (内扣) = up-axis tilts toward +X  ->  atan2(up_x, up_y) > 0
+    # Measuring atan2(up_x, up_y) directly in world space needs NO reference axis,
+    # so it is unaffected by foot yaw, shin direction, or any joint orientation
+    # that could flip or vanish (e.g. a near-vertical shin whose horizontal
+    # projection is near-zero and unstable).
+    # Sign convention unified: positive = inward roll (内扣) for both feet.
     LEFT, RIGHT = 0, 1
     specs = [(LEFT, 4, 7, 10), (RIGHT, 5, 8, 11)]  # (foot, knee, ankle, toe)
     biases = {}
@@ -363,67 +371,27 @@ def correct_foot_roll(quat, rest, roots, fps=30.):
         fwd = (pos[:, toe_j] - pos[:, ankle_j]).copy()
         fwd_n = np.linalg.norm(fwd, axis=1)
         valid_fwd = fwd_n > 1e-5
-
-        # Reference direction for the coronal plane: horizontal shin (knee→ankle).
-        # This is independent of the yaw correction already applied to the foot,
-        # so the roll measurement is not distorted by foot yaw changes.
-        shin = (pos[:, ankle_j] - pos[:, knee_j]).copy()
-        shin[:, 1] = 0.                       # project to horizontal
-        shin_n = np.linalg.norm(shin, axis=1)
-        valid_shin = shin_n > 1e-5
-        valid_base = valid_fwd & valid_shin
-
-        if not valid_base.any():
+        if not valid_fwd.any():
             biases[foot] = 0.
             median_fwds[foot] = np.array([0., 0., -1.])
             continue
-
         fwd_u = np.where(valid_fwd[:, None], fwd / np.maximum(fwd_n[:, None], 1e-9), fwd)
-        shin_u = np.where(valid_shin[:, None], shin / np.maximum(shin_n[:, None], 1e-9), shin)
-
         # Ankle's up-axis in world space (column 1 of ankle world rotation).
         up_ax = world[:, ankle_j, :, 1]  # (n, 3)
-
-        # Project up-axis onto coronal plane (perpendicular to horizontal shin).
-        # Using shin_h instead of foot-fwd makes the measurement independent of
-        # whatever yaw correction was applied before this function runs.
-        dot_shin = np.einsum('ti,ti->t', up_ax, shin_u)
-        up_perp = up_ax - dot_shin[:, None] * shin_u  # (n, 3)
-        up_perp_n = np.linalg.norm(up_perp, axis=1)
-
-        # World vertical projected onto the same coronal plane.
-        world_up = np.array([0., 1., 0.])
-        dot_wu = np.einsum('i,ti->t', world_up, shin_u)
-        ref_perp = world_up[None, :] - dot_wu[:, None] * shin_u  # (n, 3)
-        ref_perp_n = np.linalg.norm(ref_perp, axis=1)
-
-        valid = valid_base & (up_perp_n > 1e-5) & (ref_perp_n > 1e-5)
-        if not valid.any():
-            biases[foot] = 0.
-            median_fwds[foot] = np.array([0., 0., -1.])
-            continue
-
-        up_perp_u = np.where(valid[:, None], up_perp / np.maximum(up_perp_n[:, None], 1e-9), up_perp)
-        ref_perp_u = np.where(valid[:, None], ref_perp / np.maximum(ref_perp_n[:, None], 1e-9), ref_perp)
-
-        # Signed angle from ref_perp to up_perp around the shin axis.
-        # Positive = CCW around shin_h = inward tilt for left foot (up-axis toward +X).
-        # For right foot CCW around shin_h = inward tilt toward -X → negate to unify.
-        cross_vec = np.cross(ref_perp_u, up_perp_u)  # (n, 3)
-        sign = np.einsum('ti,ti->t', cross_vec, shin_u)
-        dot_ang = np.einsum('ti,ti->t', up_perp_u, ref_perp_u)
-        angle = np.degrees(np.arctan2(sign, dot_ang))
-        if foot == RIGHT:
+        # Lateral tilt: atan2(X, Y) gives the signed angle the up-axis makes with
+        # world vertical in the X-Y plane. For LEFT inward = up_x < 0, so negate.
+        angle = np.degrees(np.arctan2(up_ax[:, 0], up_ax[:, 1]))
+        if foot == LEFT:
             angle = -angle   # positive = inward roll for both feet
-
-        biases[foot] = float(np.median(angle[valid]))
-
+        # Only trust frames whose up-axis has a real lateral component; a purely
+        # vertical up-axis (flat neutral foot) gives atan2(0, ~1) = 0 anyway.
+        valid = valid_fwd & (np.abs(up_ax[:, 0]) > 1e-4)
+        biases[foot] = float(np.median(angle[valid])) if valid.any() else 0.
         # Correction rotation axis = HORIZONTAL median foot-forward (Y removed).
         # The ankle→toe vector has a slight downward (-Y) tilt; using it directly
-        # adds a yaw component to the correction that makes the legs appear to
-        # rotate inward. Projecting to the horizontal plane keeps the correction
-        # as a pure frontal-plane roll with no yaw contamination.
-        mf = np.median(fwd_u[valid], axis=0)
+        # adds a yaw component to the correction. Projecting to the horizontal
+        # plane keeps the correction a pure frontal-plane roll with no yaw leak.
+        mf = np.median(fwd_u[valid], axis=0) if valid.any() else np.median(fwd_u[valid_fwd], axis=0)
         mf[1] = 0.          # discard vertical component
         mf_n = np.linalg.norm(mf)
         median_fwds[foot] = mf / max(mf_n, 1e-9) if mf_n > 1e-6 else np.array([0., 0., -1.])
@@ -439,17 +407,19 @@ def correct_foot_roll(quat, rest, roots, fps=30.):
         return dict(empty, foot_roll_bias_left_deg=bias_left,
                     foot_roll_bias_right_deg=bias_right)
     # Apply correction: rotate each ankle's world orientation by a constant
-    # rotation about the foot's median forward axis.
-    # For left foot: +corr_left (CCW around fwd viewed from behind) = outward correction.
-    # For right foot: -corr_right (CW around fwd) = outward correction.
+    # rotation about the foot's median horizontal forward axis.
+    # With SMPL-X convention (+X = LEFT side):
+    #   Left  outward correction = rotate up_ax toward +X = CCW around -Z (foot-fwd)
+    #                            = angle_rad = radians(-corr_left)  [corr_left < 0]
+    #   Right outward correction = rotate up_ax toward -X = CW around -Z
+    #                            = angle_rad = radians(+corr_right) [corr_right < 0]
     local = Rotation.from_quat(np.asarray(quat)[..., [1, 2, 3, 0]].reshape(-1, 4)).as_matrix().reshape(n, 22, 3, 3)
     for foot, knee_j, ankle_j, _ in specs:
         corr_deg = corr_left if foot == LEFT else corr_right
         if abs(corr_deg) < 1e-3:
             continue
         axis = median_fwds[foot]
-        # Left: rotate by +corr_deg around fwd (outward). Right: -corr_deg.
-        angle_rad = np.radians(corr_deg if foot == LEFT else -corr_deg)
+        angle_rad = np.radians(-corr_deg if foot == LEFT else corr_deg)
         R_world = Rotation.from_rotvec(axis * angle_rad).as_matrix()
         new_world_ankle = np.einsum('ij,tjk->tik', R_world, world[:, ankle_j])
         local[:, ankle_j] = world[:, knee_j].swapaxes(-1, -2) @ new_world_ankle
