@@ -34,6 +34,14 @@ _LEAN_CAP_K = 1.0
 _HEAD_PITCH_THRESHOLD = 5.
 _HEAD_PITCH_MAX = 35.
 _HEAD_NECK_SHARE = .45
+# Foot yaw: a frontal monocular fit cannot constrain foot rotation around the
+# vertical axis (the silhouette barely changes), so models like ExMR tend to
+# produce systematically inward-pointing feet (内八/pigeon-toed). Treat the
+# take-median signed angle between the foot direction and the shin direction
+# as a posture bias and neutralise it with one constant world-Y rotation per
+# ankle. Per-frame foot articulation and contact-locked ankle positions stay exact.
+_FOOT_YAW_THRESHOLD = 5.   # degrees; below this the bias is within normal stance
+_FOOT_YAW_MAX = 25.        # degrees; cap to avoid overcorrection
 
 
 def backend():
@@ -223,6 +231,84 @@ def straighten_upper_spine(quat,fps=30.):
     report.update(spine_pitch_correction_deg=extra,
                   neck_world_pitch_after_deg=float(np.median(after)))
     return report
+
+
+def correct_foot_yaw(quat, rest, roots, fps=30.):
+    """Neutralise a systematic toe-in (内八) bias on the ankle joints.
+
+    Monocular frontal cameras cannot reliably constrain foot yaw: rotating
+    the foot around the vertical axis barely changes the silhouette, so ExMR
+    can settle tens of degrees inward for a whole take. The take-median signed
+    angle between the foot direction (ankle→toe) and the shin direction
+    (knee→ankle), both projected to horizontal, is treated as a posture bias.
+    One constant world-Y rotation is applied to each ankle's local quaternion.
+    Per-frame foot articulation is preserved, and contact-locked ankle positions
+    are unchanged because the ankle local rotation does not affect ankle position.
+    """
+    empty = dict(foot_yaw_correction=False,
+                 foot_yaw_bias_left_deg=0., foot_yaw_bias_right_deg=0.)
+    n = len(quat)
+    if n < max(2, int(round(fps))):
+        return empty
+    rest_a = np.asarray(rest, dtype=float)
+    roots_a = np.asarray(roots, dtype=float)
+    pos, world = fk(rest_a, roots_a, np.asarray(quat))
+    # Signed angle: positive = counterclockwise from above (+Y).
+    # For left foot CCW = outward; for right foot CCW = inward.
+    # Normalise so positive = toe-out for both sides (negate right).
+    LEFT, RIGHT = 0, 1
+    specs = [(LEFT, 4, 7, 10), (RIGHT, 5, 8, 11)]  # (foot, knee, ankle, toe)
+    biases = {}
+    for foot, knee_j, ankle_j, toe_j in specs:
+        toe_h = (pos[:, toe_j] - pos[:, ankle_j]).copy(); toe_h[:, 1] = 0.
+        shin_h = (pos[:, ankle_j] - pos[:, knee_j]).copy(); shin_h[:, 1] = 0.
+        toe_n = np.linalg.norm(toe_h, axis=1)
+        shin_n = np.linalg.norm(shin_h, axis=1)
+        valid = (toe_n > 1e-5) & (shin_n > 1e-5)
+        if not valid.any():
+            biases[foot] = 0.
+            continue
+        toe_u = np.where(valid[:, None], toe_h / np.maximum(toe_n[:, None], 1e-9), toe_h)
+        shin_u = np.where(valid[:, None], shin_h / np.maximum(shin_n[:, None], 1e-9), shin_h)
+        # Cross product Y component gives the signed angle direction.
+        cross_y = toe_u[:, 0] * shin_u[:, 2] - toe_u[:, 2] * shin_u[:, 0]
+        dot = np.einsum('ti,ti->t', toe_u, shin_u)
+        angle = np.degrees(np.arctan2(cross_y, dot))
+        if foot == RIGHT:
+            angle = -angle   # positive = toe-out for both feet
+        biases[foot] = float(np.median(angle[valid]))
+    bias_left = biases.get(LEFT, 0.)
+    bias_right = biases.get(RIGHT, 0.)
+    def _correction(bias):
+        if abs(bias) < _FOOT_YAW_THRESHOLD:
+            return 0.
+        return float(np.clip(-bias, -_FOOT_YAW_MAX, _FOOT_YAW_MAX))
+    corr_left = _correction(bias_left)
+    corr_right = _correction(bias_right)
+    if abs(corr_left) < 1e-3 and abs(corr_right) < 1e-3:
+        return dict(empty, foot_yaw_bias_left_deg=bias_left, foot_yaw_bias_right_deg=bias_right)
+    # Apply corrections: rotate each ankle's LOCAL quaternion so that the ankle's
+    # WORLD orientation is rotated by a constant world-Y angle.
+    # new_local_ankle = world_knee^T @ R_world_Y @ world_ankle
+    local = Rotation.from_quat(np.asarray(quat)[..., [1, 2, 3, 0]].reshape(-1, 4)).as_matrix().reshape(n, 22, 3, 3)
+    for foot, knee_j, ankle_j, _ in specs:
+        corr_deg = corr_left if foot == LEFT else corr_right
+        if abs(corr_deg) < 1e-3:
+            continue
+        # Left foot: +corr_deg CCW = outward. Right foot: -corr_deg CW = outward.
+        angle_rad = np.radians(corr_deg if foot == LEFT else -corr_deg)
+        R_world = Rotation.from_rotvec(np.array([0., angle_rad, 0.])).as_matrix()
+        new_world_ankle = np.einsum('ij,tjk->tik', R_world, world[:, ankle_j])
+        local[:, ankle_j] = world[:, knee_j].swapaxes(-1, -2) @ new_world_ankle
+        world[:, ankle_j] = new_world_ankle   # keep world consistent for diagnostics
+    quat[..., [1, 2, 3, 0]] = Rotation.from_matrix(local.reshape(-1, 3, 3)).as_quat().reshape(n, 22, 4)
+    return dict(
+        foot_yaw_correction=True,
+        foot_yaw_bias_left_deg=bias_left,
+        foot_yaw_bias_right_deg=bias_right,
+        foot_yaw_correction_left_deg=corr_left,
+        foot_yaw_correction_right_deg=corr_right,
+    )
 
 
 def balance_pose(rest,root,quat,probes,active,floor,fps,max_pitch=12.,deadband=.02,iterations=3,max_total=10.,reach_allow=.03):
@@ -1037,6 +1123,14 @@ def run(project,emit,result):
                     report.update(posture)
                     if posture.get('head_posture'):
                         report['method']=report['method']+'; take-wide neck/head pitch neutralised about the chest axis'
+                # Foot yaw: monocular frontal fits cannot constrain foot rotation
+                # around the vertical axis. Apply after head correction so the
+                # ankle positions written to pose are already contact-corrected.
+                if options.get('foot_yaw',True):
+                    yaw=correct_foot_yaw(out_quats,geometry.rest[:22],out_roots,fps)
+                    report.update(yaw)
+                    if yaw.get('foot_yaw_correction'):
+                        report['method']=report['method']+'; take-wide foot toe-in (内八) neutralised about the vertical axis'
                 report['contact_revision']=contact_revision
                 if shared:report['shared_floor']=shared
                 if contact_warning:report['warning']=' '.join(filter(None,(report['warning'],contact_warning)))
