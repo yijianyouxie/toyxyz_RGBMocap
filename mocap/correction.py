@@ -49,7 +49,7 @@ _FOOT_YAW_MAX = 15.        # degrees; cap to avoid overcorrection
 # away from world vertical as a posture bias and neutralise it with one
 # constant rotation about the foot's forward axis per ankle. Ankle positions
 # stay exact (the ankle local rotation does not affect its FK position).
-_FOOT_ROLL_THRESHOLD = 3.   # degrees; below this the bias is within normal stance
+_FOOT_ROLL_THRESHOLD = 2.   # degrees; below this the bias is within normal stance
 _FOOT_ROLL_MAX = 15.       # degrees; cap to avoid overcorrection
 
 
@@ -393,10 +393,15 @@ def correct_foot_roll(quat, rest, roots, fps=30.):
         if foot == RIGHT:
             angle = -angle
         biases[foot] = float(np.median(angle[valid]))
-        # Median foot-forward direction for the correction rotation axis.
+        # Correction rotation axis = HORIZONTAL median foot-forward (Y removed).
+        # The ankle→toe vector has a slight downward (-Y) tilt; using it directly
+        # adds a yaw component to the correction that makes the legs appear to
+        # rotate inward. Projecting to the horizontal plane keeps the correction
+        # as a pure frontal-plane roll with no yaw contamination.
         mf = np.median(fwd_u[valid], axis=0)
+        mf[1] = 0.          # discard vertical component
         mf_n = np.linalg.norm(mf)
-        median_fwds[foot] = mf / max(mf_n, 1e-9) if mf_n > 1e-9 else np.array([0., 0., -1.])
+        median_fwds[foot] = mf / max(mf_n, 1e-9) if mf_n > 1e-6 else np.array([0., 0., -1.])
     bias_left = biases.get(LEFT, 0.)
     bias_right = biases.get(RIGHT, 0.)
     def _correction(bias):
